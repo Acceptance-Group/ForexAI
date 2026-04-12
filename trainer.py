@@ -160,8 +160,8 @@ def run_training():
         lr=TRAIN_CONFIG["learning_rate"],
         weight_decay=TRAIN_CONFIG["weight_decay"],
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=50, T_mult=2
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=TRAIN_CONFIG["epochs"], eta_min=1e-5
     )
 
     for fold, (train_idx, val_idx) in enumerate(tscv.split(X_all)):
@@ -174,7 +174,7 @@ def run_training():
         print(f"Fold {fold + 1}/{TRAIN_CONFIG['n_splits']}")
         print(f"Train: {len(train_idx_purged)}, Val: {len(val_idx)}")
 
-        # Reinitialize model and optimizer for each fold
+        
         model = ForexClassifier(feature_weights=FEATURE_WEIGHTS).to(DEVICE)
         criterion = FocalLoss(
             alpha=TRAIN_CONFIG["focal_alpha"],
@@ -185,8 +185,8 @@ def run_training():
             lr=TRAIN_CONFIG["learning_rate"],
             weight_decay=TRAIN_CONFIG["weight_decay"],
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=50, T_mult=2
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=TRAIN_CONFIG["epochs"], eta_min=1e-5
         )
         best_da_fold = 0.0
         patience_counter = 0
@@ -219,10 +219,11 @@ def run_training():
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
-                scheduler.step(epoch)
 
                 total_loss += loss.item()
                 n_batches += 1
+
+            scheduler.step()
 
             train_loss = total_loss / n_batches
 
@@ -237,26 +238,31 @@ def run_training():
 
             if val_da > best_da_fold:
                 best_da_fold = val_da
+                patience_counter = 0
                 if val_da > best_da:
                     best_da = val_da
-                patience_counter = 0
-                os.makedirs(os.path.dirname(MODEL_SAVE_PATH), exist_ok=True)
-                torch.save(model.state_dict(), MODEL_SAVE_PATH)
+                    os.makedirs(os.path.dirname(MODEL_SAVE_PATH), exist_ok=True)
+                    torch.save(model.state_dict(), MODEL_SAVE_PATH)
             else:
                 patience_counter += 1
                 if patience_counter >= TRAIN_CONFIG["patience"]:
                     print(f"Early stopping at epoch {epoch}")
                     break
 
-    # Feature importance
-    print("\nComputing feature importance...")
+    
+    print(f"\nLoading best saved model (Best Val DA={best_da:.1f}%)...")
+    model = ForexClassifier(feature_weights=FEATURE_WEIGHTS).to(DEVICE)
+    model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=DEVICE, weights_only=True))
     model.eval()
+
+    
+    print("\nComputing feature importance...")
     n_imp = min(500, len(X_all))
     X_base = torch.tensor(X_all[:n_imp], dtype=torch.float32).to(DEVICE)
     y_base_np = y_label_all[:n_imp]
 
     with torch.no_grad():
-        base_probs = model.predict_proba(X_base).cpu().numpy()
+        base_probs = model.predict_proba(X_base).detach().cpu().numpy()
         base_preds = (base_probs > 0.5).astype(float)
         base_acc = np.mean(base_preds == y_base_np)
 
@@ -271,7 +277,7 @@ def run_training():
 
             X_perm_t = torch.tensor(X_perm, dtype=torch.float32).to(DEVICE)
             with torch.no_grad():
-                perm_probs = model.predict_proba(X_perm_t).cpu().numpy()
+                perm_probs = model.predict_proba(X_perm_t).detach().cpu().numpy()
                 perm_preds = (perm_probs > 0.5).astype(float)
                 perm_acc = np.mean(perm_preds == y_base_np)
                 drops.append(perm_acc)
@@ -291,11 +297,10 @@ def run_training():
         bar = "#" * max(0, int(w * 20))
         print(f"  {fname:20s} {w:.2f} {bar}")
 
-    # Auto-correct signal direction: if DA < 50%, flip classifier weights
-    model.eval()
+    
     with torch.no_grad():
         X_check = torch.tensor(X_all[-500:], dtype=torch.float32).to(DEVICE)
-        probs = model.predict_proba(X_check).cpu().numpy()
+        probs = model.predict_proba(X_check).detach().cpu().numpy()
     y_check = y_label_all[-500:]
     preds = (probs > 0.5).astype(float)
     da = np.mean(preds == y_check) * 100
@@ -310,7 +315,7 @@ def run_training():
                 elif 'bias' in name:
                     param.data = -param.data
 
-        probs_after = model.predict_proba(X_check).cpu().numpy()
+        probs_after = model.predict_proba(X_check).detach().cpu().numpy()
         preds_after = (probs_after > 0.5).astype(float)
         da_after = np.mean(preds_after == y_check) * 100
         print(f"    DA after correction: {da_after:.1f}%")

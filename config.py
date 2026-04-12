@@ -9,6 +9,8 @@ DATA_CONFIG = {
     "barrier_max_days": 10,
     "temperature": 5.0,
     "trade_threshold": 0.505,
+    "trade_threshold_down": 0.505,
+    "trade_threshold_up": 0.515,
     "atr_period": 14,
     "atr_filter_quantile": 0.25,
 }
@@ -68,22 +70,29 @@ MODEL_CONFIG = {
     "input_dim": INPUT_DIM,
     "hidden_dim": 64,
     "n_layers": 2,
-    "dropout": 0.15,
+    "dropout": 0.10,
     "n_heads": 4,
     "temperature": 5.0,
 }
 
 TRAIN_CONFIG = {
-    "epochs": 300,
+    "epochs": 500,
     "batch_size": 256,
     "learning_rate": 3e-3,
-    "weight_decay": 1e-4,
-    "patience": 35,
+    "weight_decay": 5e-5,
+    "patience": 50,
     "n_splits": 5,
     "purge_gap": 5,
     "focal_alpha": 0.55,
-    "focal_gamma": 2.5,
+    "focal_gamma": 2.0,
     "label_sharpening": 0.15,
+}
+
+RISK_CONFIG = {
+    "risk_per_trade": 0.01,
+    "max_lot_multiplier": 5.0,
+    "min_lot_multiplier": 0.1,
+    "initial_equity": 10000.0,
 }
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

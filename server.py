@@ -9,7 +9,7 @@ import torch
 from flask import Flask, jsonify, send_file
 from sklearn.preprocessing import StandardScaler
 
-from config import DATA_CONFIG, DEVICE, MODEL_SAVE_PATH, SCALER_SAVE_PATH, FEATURE_COLUMNS, FEATURE_WEIGHTS
+from config import DATA_CONFIG, DEVICE, MODEL_SAVE_PATH, SCALER_SAVE_PATH, FEATURE_COLUMNS, FEATURE_WEIGHTS, RISK_CONFIG
 from data_loader import load_dataset, load_raw_prices, build_dataset
 from model import ForexClassifier
 
@@ -103,20 +103,47 @@ def predict_api():
     scaled = scaler.transform(feats.values)
     lookback = DATA_CONFIG["lookback"]
     current_price = prices[-1]
-    threshold = DATA_CONFIG["trade_threshold"]
+    threshold_up = DATA_CONFIG["trade_threshold_up"]
+    threshold_down = DATA_CONFIG["trade_threshold_down"]
+    risk_pct = RISK_CONFIG["risk_per_trade"]
 
     with torch.no_grad():
         seq = scaled[-lookback:]
         X = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(DEVICE)
         prob = model.predict_proba(X).cpu().item()
-        signal, confidence, _ = model.trading_signal(X, threshold=threshold)
 
     direction = "UP" if prob > 0.5 else "DOWN"
-    signal_str = "BUY" if signal.item() > 0 else "SELL" if signal.item() < 0 else "HOLD"
+
+    
+    if prob > threshold_up:
+        signal_str = "BUY"
+    elif prob < (1 - threshold_down):
+        signal_str = "SELL"
+    else:
+        signal_str = "HOLD"
+
+    confidence = abs(prob - 0.5) * 2.0
 
     daily_ranges = np.diff(prices[-20:])
     atr = np.mean(np.abs(daily_ranges))
     atr_pct = atr / current_price * 100
+
+    
+    sl_distance = atr
+    sl_pct = sl_distance / current_price if current_price > 0 else 0.01
+    lot_multiplier = risk_pct / sl_pct if sl_pct > 0 else 1.0
+    lot_multiplier = float(np.clip(lot_multiplier, RISK_CONFIG["min_lot_multiplier"], RISK_CONFIG["max_lot_multiplier"]))
+
+    
+    if signal_str == "BUY":
+        sl_price = current_price - sl_distance
+        tp_price = current_price * (1 + DATA_CONFIG["barrier_tp"])
+    elif signal_str == "SELL":
+        sl_price = current_price + sl_distance
+        tp_price = current_price * (1 - DATA_CONFIG["barrier_tp"])
+    else:
+        sl_price = 0.0
+        tp_price = 0.0
 
     return jsonify({
         "timestamp": datetime.now().isoformat(),
@@ -124,10 +151,16 @@ def predict_api():
         "direction": direction,
         "probability_up": round(prob * 100, 1),
         "probability_down": round((1 - prob) * 100, 1),
-        "confidence": round(confidence.item() * 100, 1),
+        "confidence": round(confidence * 100, 1),
         "signal": signal_str,
-        "threshold": threshold,
+        "threshold_up": threshold_up,
+        "threshold_down": threshold_down,
+        "lot_multiplier": round(lot_multiplier, 3),
+        "sl_price": round(sl_price, 5) if sl_price > 0 else None,
+        "tp_price": round(tp_price, 5) if tp_price > 0 else None,
+        "atr_value": round(atr, 5),
         "atr_pct": round(atr_pct, 4),
+        "risk_per_trade": risk_pct,
         "temperature": model.temperature,
     })
 
@@ -149,7 +182,9 @@ def generate_forecast_chart():
     lookback = DATA_CONFIG["lookback"]
     current_price = prices[-1]
     last_date = feats.index[-1]
-    threshold = DATA_CONFIG["trade_threshold"]
+    threshold_up = DATA_CONFIG["trade_threshold_up"]
+    threshold_down = DATA_CONFIG["trade_threshold_down"]
+    risk_pct = RISK_CONFIG["risk_per_trade"]
 
     n_days = min(30, len(feats) - lookback)
     probs = []
@@ -169,20 +204,23 @@ def generate_forecast_chart():
     with torch.no_grad():
         X = torch.tensor(scaled[-lookback:], dtype=torch.float32).unsqueeze(0).to(DEVICE)
         prob_now = model.predict_proba(X).cpu().item()
-        _, conf_now, _ = model.trading_signal(X, threshold=threshold)
 
     direction = "UP" if prob_now > 0.5 else "DOWN"
-    with torch.no_grad():
-        sig, _, _ = model.trading_signal(X, threshold=threshold)
-        signal_str = "BUY" if sig.item() > 0 else "SELL" if sig.item() < 0 else "HOLD"
+    if prob_now > threshold_up:
+        signal_str = "BUY"
+    elif prob_now < (1 - threshold_down):
+        signal_str = "SELL"
+    else:
+        signal_str = "HOLD"
+    confidence = abs(prob_now - 0.5) * 2.0
 
     fig.suptitle(
         f"EUR/USD  |  {current_price:.5f}  |  {direction} ({prob_now*100:.1f}%)  |  "
-        f"{signal_str}  |  T={model.temperature}",
-        fontsize=13, fontweight="bold"
+        f"{signal_str}  |  UP>{threshold_up} DN<{1-threshold_down:.3f}  |  T={model.temperature}",
+        fontsize=12, fontweight="bold"
     )
 
-    # 1. Signal strength
+    
     ax = axes[0, 0]
     signal_strength = [(p - 0.5) * 2 for p in probs]
     colors = ["green" if s > 0 else "red" for s in signal_strength]
@@ -194,7 +232,7 @@ def generate_forecast_chart():
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
     plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
 
-    # 2. Price + signals
+    
     ax = axes[0, 1]
     n_price = min(60, len(prices))
     recent_prices = prices[-n_price:]
@@ -202,38 +240,47 @@ def generate_forecast_chart():
     ax.plot(recent_price_dates, recent_prices, "b-", linewidth=1.0, label="EUR/USD")
 
     for i, d in enumerate(dates_recent):
-        color = "green" if probs[i] > threshold else "red" if probs[i] < (1 - threshold) else "gray"
+        p = probs[i]
+        if p > threshold_up:
+            color = "green"
+        elif p < (1 - threshold_down):
+            color = "red"
+        else:
+            color = "gray"
         idx_offset = n_price - n_days + i
         if 0 <= idx_offset < n_price:
             ax.plot(d, recent_prices[idx_offset], "o", color=color, markersize=5)
 
-    ax.set_title("Price + Signals (green=BUY, red=SELL)")
+    ax.set_title("Price + Signals (green=BUY, red=SELL, gray=HOLD)")
     ax.set_ylabel("EUR/USD")
     ax.legend(loc="upper left")
     ax.grid(True, alpha=0.3)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
     plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
 
-    # 3. Probability histogram
+    
     ax = axes[1, 0]
     ax.hist(probs, bins=15, color="steelblue", edgecolor="black", alpha=0.7)
     ax.axvline(0.5, color="black", linestyle="--", linewidth=1.5, label="0.5")
-    ax.axvline(threshold, color="orange", linestyle=":", linewidth=1.0, label=f"Threshold={threshold}")
-    ax.axvline(1 - threshold, color="orange", linestyle=":", linewidth=1.0)
-    ax.set_title(f"Recent P(UP) Distribution (T={model.temperature})")
+    ax.axvline(threshold_up, color="green", linestyle="-", linewidth=1.0, label=f"UP threshold={threshold_up}")
+    ax.axvline(1 - threshold_down, color="red", linestyle="-", linewidth=1.0, label=f"DN threshold={1-threshold_down:.3f}")
+    ax.set_title(f"Recent P(UP) Distribution (Asymmetric T, T_model={model.temperature})")
     ax.set_xlabel("P(UP)")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # 4. Summary
+    
     ax = axes[1, 1]
     ax.axis("off")
     summary = (
         f"Direction:  {direction}\n\n"
         f"P(UP):      {prob_now*100:.1f}%\n"
         f"P(DOWN):    {(1-prob_now)*100:.1f}%\n\n"
-        f"Confidence: {conf_now.item()*100:.1f}%\n"
+        f"Confidence: {confidence*100:.1f}%\n"
         f"Signal:     {signal_str}\n\n"
+        f"Threshold UP:   {threshold_up}\n"
+        f"Threshold DN:   {1-threshold_down:.3f}\n"
+        f"Risk/Trade:      {risk_pct*100:.1f}%\n\n"
         f"Price:       {current_price:.5f}\n"
         f"Temperature: {model.temperature}"
     )
