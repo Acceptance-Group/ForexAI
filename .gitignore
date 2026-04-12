@@ -181,5 +181,4 @@ cython_debug/
 .cursorindexingignore
 /data
 /models
-backtest_chart.png
-backtest_results.csv
+/backtest

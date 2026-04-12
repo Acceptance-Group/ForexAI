@@ -2,6 +2,7 @@ import os
 import pickle
 
 import numpy as np
+import pandas as pd
 import torch
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit
@@ -106,6 +107,10 @@ def run_training():
     if feats_df.empty:
         feats_df = build_dataset()
 
+    start_date = DATA_CONFIG["start_date"]
+    if isinstance(start_date, str):
+        start_date = pd.Timestamp(start_date)
+
     prices_df = load_raw_prices()
     labels_df = load_labels()
 
@@ -117,6 +122,11 @@ def run_training():
     feats_df = feats_df.loc[price_common]
     labels_df = labels_df.loc[price_common]
     prices_df = prices_df.loc[price_common]
+
+    train_mask = feats_df.index >= start_date
+    feats_df = feats_df[train_mask]
+    labels_df = labels_df[train_mask]
+    prices_df = prices_df.loc[feats_df.index]
 
     print(f"Dataset: {len(feats_df)} samples, {len(FEATURE_COLUMNS)} features")
     print(f"Features: {FEATURE_COLUMNS}")
@@ -161,8 +171,9 @@ def run_training():
         weight_decay=TRAIN_CONFIG["weight_decay"],
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=TRAIN_CONFIG["epochs"], eta_min=1e-5
+        optimizer, T_max=TRAIN_CONFIG["epochs"], eta_min=1e-6
     )
+    warmup_epochs = 5
 
     for fold, (train_idx, val_idx) in enumerate(tscv.split(X_all)):
         purge = max(0, min(val_idx) - purge_gap)
@@ -186,8 +197,9 @@ def run_training():
             weight_decay=TRAIN_CONFIG["weight_decay"],
         )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=TRAIN_CONFIG["epochs"], eta_min=1e-5
+            optimizer, T_max=TRAIN_CONFIG["epochs"], eta_min=1e-6
         )
+        warmup_epochs = 5
         best_da_fold = 0.0
         patience_counter = 0
 
@@ -206,6 +218,11 @@ def run_training():
         )
 
         for epoch in range(1, TRAIN_CONFIG["epochs"] + 1):
+            if epoch <= warmup_epochs:
+                warmup_factor = epoch / warmup_epochs
+                for pg in optimizer.param_groups:
+                    pg['lr'] = TRAIN_CONFIG["learning_rate"] * warmup_factor
+
             model.train()
             total_loss = 0.0
             n_batches = 0
@@ -305,7 +322,7 @@ def run_training():
     preds = (probs > 0.5).astype(float)
     da = np.mean(preds == y_check) * 100
 
-    if da < 50.0:
+    if da < 35.0:
         print(f"\n*** SIGNAL INVERSION DETECTED (DA={da:.1f}%) ***")
         print(f"    Flipping classifier head weights to correct direction...")
         with torch.no_grad():

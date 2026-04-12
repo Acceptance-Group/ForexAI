@@ -49,6 +49,7 @@ class ForexClassifier(nn.Module):
         self.input_proj = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout),
         )
 
         self.pos_enc = PositionalEncoding(hidden_dim)
@@ -59,10 +60,9 @@ class ForexClassifier(nn.Module):
         self.attention = SelfAttention(hidden_dim, n_heads)
 
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
         self._init_weights()
