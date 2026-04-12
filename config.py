@@ -13,6 +13,7 @@ DATA_CONFIG = {
     "atr_period": 14,
     "atr_filter_quantile": 0.05,
     "tp_sl_ratio": 3.5,
+    "min_sl_pips": 20.0,
     "trend_filter_ma": 0,
 }
 
@@ -93,14 +94,18 @@ TRAIN_CONFIG = {
 
 RISK_CONFIG = {
     "risk_per_trade": 0.02,
-    "max_position_fraction": 2.0,
+    "max_leverage": 30.0,
     "initial_equity": 10000.0,
+    "pip_value_per_lot": 10.0,
+    "lot_step": 0.01,
+    "min_lots": 0.01,
+    "contract_size": 100000,
 }
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 BACKTEST_CONFIG = {
-    "start_date": "2023-01-01",
+    "start_date": "2025-01-01",
     "end_date": "2026-01-01",
 }
 

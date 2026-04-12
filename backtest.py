@@ -22,12 +22,9 @@ def profit_factor(returns):
     return gross_profit / gross_loss
 
 
-def max_drawdown(returns):
-    if len(returns) == 0:
-        return 0.0
-    curve = np.cumprod(1 + returns)
-    running_max = np.maximum.accumulate(curve)
-    dd = (curve - running_max) / running_max
+def max_dd_from_equity(equity_arr):
+    running_max = np.maximum.accumulate(equity_arr)
+    dd = (equity_arr - running_max) / running_max
     return dd.min()
 
 
@@ -61,9 +58,14 @@ def run_backtest():
     no_trade_low = DATA_CONFIG["no_trade_low"]
     no_trade_high = DATA_CONFIG["no_trade_high"]
     tp_sl_ratio = DATA_CONFIG["tp_sl_ratio"]
-    risk_pct = RISK_CONFIG["risk_per_trade"]
-    max_pos_frac = RISK_CONFIG["max_position_fraction"]
+    min_sl_pips = DATA_CONFIG.get("min_sl_pips", 20.0)
+    risk_per_trade = RISK_CONFIG["risk_per_trade"]
+    max_leverage = RISK_CONFIG["max_leverage"]
     initial_equity = RISK_CONFIG["initial_equity"]
+    pip_value = RISK_CONFIG["pip_value_per_lot"]
+    lot_step = RISK_CONFIG.get("lot_step", 0.01)
+    min_lots = RISK_CONFIG.get("min_lots", 0.01)
+    contract_size = RISK_CONFIG.get("contract_size", 100000)
 
     # Feature importance
     print("\nComputing feature importance...")
@@ -112,141 +114,243 @@ def run_backtest():
         return
 
     atr_series = pd.Series(eurusd).diff().abs().rolling(DATA_CONFIG["atr_period"]).mean()
-    atr_mean = atr_series.rolling(60).mean()
-    atr_threshold = atr_series.rolling(60).quantile(DATA_CONFIG["atr_filter_quantile"])
+    atr_mean = atr_series.rolling(60, min_periods=1).mean()
 
-    dates_list = []
-    actual_returns = []
-    dir_probs = []
-    signals = []
-    pos_fractions = []
-    returns_tpsl = []
-
+    # Pre-compute probabilities
+    all_probs = []
     with torch.no_grad():
         for idx in bt_indices:
             seq = scaled[idx - lookback:idx]
             X = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(DEVICE)
             prob = model.predict_proba(X).detach().cpu().item()
+            all_probs.append(prob)
+    all_probs = np.array(all_probs)
 
-            current_price = eurusd[idx - 1]
-            next_price = eurusd[idx]
-            actual_ret = np.log(next_price / current_price) if current_price > 0 else 0.0
+    # --- TRADING SIMULATION ---
+    equity = initial_equity
+    equity_curve = [initial_equity]
 
-            idx_date = feats_df.index[idx]
-            atr_val = atr_series.iloc[idx] if idx < len(atr_series) else np.nan
-            atr_thr = atr_threshold.iloc[idx] if idx < len(atr_threshold) else np.nan
-            atr_mean_val = atr_mean.iloc[idx] if idx < len(atr_mean) else np.nan
+    all_dates = []
+    all_equity = []
+    all_probs_tracked = []
+    all_signals = []
+    all_pnl = []
+    all_lots = []
+    all_pips = []
+    actual_returns_pct = []
 
-            atr_ok = not np.isnan(atr_val)
+    trade_pips = []
+    trade_pnl_dollars = []
+    trade_lots_list = []
+    long_count = 0
+    short_count = 0
+    wins = 0
+    losses = 0
+    long_wins = 0
+    long_losses = 0
+    short_wins = 0
+    short_losses = 0
+    total_sl_pips = 0.0
+    total_tp_pips = 0.0
 
-            signal = 0.0
-            pos_frac = 0.0
-            tm_ret = 0.0
+    for i, idx in enumerate(bt_indices):
+        prob = all_probs[i]
+        current_price = eurusd[idx - 1]
+        next_price = eurusd[idx]
+        price_move_pips = (next_price - current_price) * 10000
+        actual_ret = np.log(next_price / current_price) if current_price > 0 else 0.0
 
-            if atr_ok:
-                if prob > no_trade_high:
-                    signal = 1.0
-                elif prob < no_trade_low:
-                    signal = -1.0
+        atr_val = atr_series.iloc[idx] if idx < len(atr_series) else np.nan
+        atr_mean_val = atr_mean.iloc[idx] if idx < len(atr_mean) else np.nan
 
-                if signal != 0.0:
-                    sl_pct = atr_val / current_price if atr_val > 0 and current_price > 0 else 0.01
-                    if not np.isnan(atr_mean_val) and atr_mean_val > 0:
-                        vol_ratio = atr_val / atr_mean_val
-                        dyn_tp_sl = tp_sl_ratio / max(vol_ratio, 0.5)
-                        dyn_tp_sl = min(dyn_tp_sl, 4.0)
+        idx_date = feats_df.index[idx]
+
+        signal = 0.0
+        lots = 0.0
+        pips_result = 0.0
+        pnl = 0.0
+
+        if not np.isnan(atr_val) and atr_val > 0:
+            if prob > no_trade_high:
+                signal = 1.0
+            elif prob < no_trade_low:
+                signal = -1.0
+
+            if signal != 0.0:
+                sl_pips = max(atr_val * 10000, min_sl_pips)
+
+                if not np.isnan(atr_mean_val) and atr_mean_val > 0:
+                    vol_ratio = atr_val / atr_mean_val
+                    dyn_tp_sl = tp_sl_ratio / max(vol_ratio, 0.5)
+                    dyn_tp_sl = min(dyn_tp_sl, 4.0)
+                else:
+                    dyn_tp_sl = tp_sl_ratio
+
+                tp_pips = sl_pips * dyn_tp_sl
+
+                risk_dollars = equity * risk_per_trade
+                lots = risk_dollars / (sl_pips * pip_value)
+                lots = round(lots / lot_step) * lot_step
+                lots = max(min_lots, lots)
+
+                max_lots_val = (equity * max_leverage) / contract_size
+                max_lots_val = round(max_lots_val / lot_step) * lot_step
+                lots = min(lots, max_lots_val)
+                lots = max(min_lots, lots)
+
+                if signal > 0:  # BUY
+                    if price_move_pips >= tp_pips:
+                        pips_result = tp_pips
+                    elif price_move_pips <= -sl_pips:
+                        pips_result = -sl_pips
                     else:
-                        dyn_tp_sl = tp_sl_ratio
+                        pips_result = price_move_pips
+                else:  # SELL
+                    if price_move_pips <= -tp_pips:
+                        pips_result = tp_pips
+                    elif price_move_pips >= sl_pips:
+                        pips_result = -sl_pips
+                    else:
+                        pips_result = -price_move_pips
 
-                    pos_frac = min(risk_pct / sl_pct, max_pos_frac) if sl_pct > 0 else 0.0
-                    tp_pct = sl_pct * dyn_tp_sl
+                pnl = lots * pip_value * pips_result
+                equity += pnl
 
+                total_sl_pips += sl_pips
+                total_tp_pips += tp_pips
+                trade_pips.append(pips_result)
+                trade_pnl_dollars.append(pnl)
+                trade_lots_list.append(lots)
+
+                if signal > 0:
+                    long_count += 1
+                else:
+                    short_count += 1
+
+                if pnl > 0:
+                    wins += 1
                     if signal > 0:
-                        if actual_ret >= tp_pct:
-                            tm_ret = tp_pct
-                        elif actual_ret <= -sl_pct:
-                            tm_ret = -sl_pct
-                        else:
-                            tm_ret = actual_ret
+                        long_wins += 1
                     else:
-                        if actual_ret <= -tp_pct:
-                            tm_ret = tp_pct
-                        elif actual_ret >= sl_pct:
-                            tm_ret = -sl_pct
-                        else:
-                            tm_ret = -actual_ret
+                        short_wins += 1
+                elif pnl < 0:
+                    losses += 1
+                    if signal > 0:
+                        long_losses += 1
+                    else:
+                        short_losses += 1
 
-            dates_list.append(idx_date)
-            actual_returns.append(actual_ret)
-            dir_probs.append(prob)
-            signals.append(signal)
-            pos_fractions.append(pos_frac)
-            returns_tpsl.append(tm_ret * pos_frac)
+        all_dates.append(idx_date)
+        all_equity.append(equity)
+        all_probs_tracked.append(prob)
+        all_signals.append(signal)
+        all_pnl.append(pnl)
+        all_lots.append(lots)
+        all_pips.append(pips_result)
+        actual_returns_pct.append(actual_ret)
 
-    actual_returns = np.array(actual_returns)
-    dir_probs = np.array(dir_probs)
-    signals = np.array(signals)
-    pos_fractions = np.array(pos_fractions)
-    returns_tpsl = np.array(returns_tpsl)
-    dates = pd.to_datetime(dates_list)
+    # --- STATISTICS ---
+    all_equity = np.array(all_equity)
+    all_probs_tracked = np.array(all_probs_tracked)
+    all_signals = np.array(all_signals)
+    all_pnl = np.array(all_pnl)
+    trade_pips = np.array(trade_pips)
+    trade_pnl_dollars = np.array(trade_pnl_dollars)
+    trade_lots_arr = np.array(trade_lots_list)
+    actual_returns_pct = np.array(actual_returns_pct)
+    dates = pd.to_datetime(all_dates)
 
-    traded_mask = signals != 0
-    n_trades = int(traded_mask.sum())
-    trade_freq = traded_mask.sum() / len(traded_mask) * 100
+    n_trades = wins + losses
+    n_total = len(all_signals)
+    trade_freq = n_trades / n_total * 100
 
-    cum_tpsl = np.cumprod(1 + returns_tpsl) - 1
-    cum_hold = np.cumprod(1 + actual_returns) - 1
-
-    final_equity = initial_equity * (1 + cum_tpsl[-1])
+    final_equity = all_equity[-1]
     net_profit = final_equity - initial_equity
-    md = max_drawdown(returns_tpsl)
-    pf = profit_factor(returns_tpsl[traded_mask]) if traded_mask.any() else 0.0
-    sharpe = np.mean(returns_tpsl) / (np.std(returns_tpsl) + 1e-8) * np.sqrt(252)
+    total_pips = trade_pips.sum()
+    avg_lots = trade_lots_arr.mean() if len(trade_lots_arr) > 0 else 0
+    max_lots_used = trade_lots_arr.max() if len(trade_lots_arr) > 0 else 0
+    avg_sl_pips = total_sl_pips / n_trades if n_trades > 0 else 0
+    avg_tp_pips = total_tp_pips / n_trades if n_trades > 0 else 0
 
-    actual_dir = (actual_returns > 0).astype(float)
-    pred_dir = (dir_probs > 0.5).astype(float)
+    md_pct = max_dd_from_equity(all_equity)
+    md_dollars = all_equity[np.argmin(np.maximum.accumulate(all_equity) - all_equity)] - \
+                 np.max(np.maximum.accumulate(all_equity))
+
+    pf_dollars = profit_factor(trade_pnl_dollars) if len(trade_pnl_dollars) > 0 else 0.0
+
+    daily_returns = np.diff(all_equity) / all_equity[:-1]
+    sharpe = np.mean(daily_returns) / (np.std(daily_returns) + 1e-8) * np.sqrt(252)
+
+    actual_dir = (actual_returns_pct > 0).astype(float)
+    pred_dir = (all_probs_tracked > 0.5).astype(float)
     da_raw = np.mean(pred_dir == actual_dir) * 100
+    traded_mask = all_signals != 0
     da_traded = np.mean(pred_dir[traded_mask] == actual_dir[traded_mask]) * 100 if traded_mask.any() else 0.0
 
-    n_long = int((signals > 0).sum())
-    n_short = int((signals < 0).sum())
-    prec_long = np.mean(actual_dir[signals > 0] == 1) * 100 if n_long > 0 else 0.0
-    prec_short = np.mean(actual_dir[signals < 0] == 0) * 100 if n_short > 0 else 0.0
+    n_long = int((all_signals > 0).sum())
+    n_short = int((all_signals < 0).sum())
+    prec_long = np.mean(actual_dir[all_signals > 0] == 1) * 100 if n_long > 0 else 0.0
+    prec_short = np.mean(actual_dir[all_signals < 0] == 0) * 100 if n_short > 0 else 0.0
 
-    wins = returns_tpsl[traded_mask][returns_tpsl[traded_mask] > 0]
-    losses = returns_tpsl[traded_mask][returns_tpsl[traded_mask] < 0]
-    wr = len(wins) / (len(wins) + len(losses)) * 100 if (len(wins) + len(losses)) > 0 else 0.0
-    avg_win = np.mean(wins) * 100 if len(wins) > 0 else 0.0
-    avg_loss = abs(np.mean(losses)) * 100 if len(losses) > 0 else 0.0
-    wl_ratio = avg_win / avg_loss if avg_loss > 0 else float("inf")
+    wr = wins / n_trades * 100 if n_trades > 0 else 0.0
+    winning_pips = trade_pips[trade_pips > 0]
+    losing_pips = trade_pips[trade_pips < 0]
+    winning_dollars = trade_pnl_dollars[trade_pnl_dollars > 0]
+    losing_dollars = trade_pnl_dollars[trade_pnl_dollars < 0]
+    avg_win_pips = np.mean(winning_pips) if len(winning_pips) > 0 else 0.0
+    avg_loss_pips = abs(np.mean(losing_pips)) if len(losing_pips) > 0 else 0.0
+    avg_win_dollars = np.mean(winning_dollars) if len(winning_dollars) > 0 else 0.0
+    avg_loss_dollars = abs(np.mean(losing_dollars)) if len(losing_dollars) > 0 else 0.0
+    wl_ratio_pips = avg_win_pips / avg_loss_pips if avg_loss_pips > 0 else float("inf")
+
+    cum_hold = np.cumprod(1 + actual_returns_pct) - 1
+    hold_final = initial_equity * (1 + cum_hold[-1])
+
+    dd_arr = all_equity - np.maximum.accumulate(all_equity)
+    min_dd_idx = np.argmin(dd_arr)
+    md_dollars_exact = dd_arr[min_dd_idx]
 
     print(f"\n{'='*70}")
     print(f"  BACKTEST RESULTS ({BACKTEST_CONFIG['start_date']} - {BACKTEST_CONFIG['end_date']})")
     print(f"{'='*70}")
     print(f"  TP/SL Ratio  : {tp_sl_ratio}x (dynamic vol-scaled)")
     print(f"  No-Trade Zone: [{no_trade_low}, {no_trade_high}]")
-    print(f"  Risk/Trade   : {risk_pct*100:.1f}%, Max Position: {max_pos_frac*100:.0f}%")
-    print(f"  Samples      : {len(actual_returns)}")
+    print(f"  Risk/Trade   : {risk_per_trade*100:.1f}%  |  Max Leverage: {max_leverage:.0f}:1")
+    print(f"  Samples      : {n_total}")
     print(f"")
     print(f"  --- DIRECTIONAL ACCURACY ---")
     print(f"  DA (raw)       : {da_raw:.1f}%")
     print(f"  DA (traded)    : {da_traded:.1f}%")
-    print(f"  LONG Precision : {prec_long:.1f}% ({n_long} trades)")
-    print(f"  SHORT Precision: {prec_short:.1f}% ({n_short} trades)")
+    print(f"  LONG Precision : {prec_long:.1f}% ({long_count} trades)")
+    print(f"  SHORT Precision: {prec_short:.1f}% ({short_count} trades)")
     print(f"")
     print(f"  --- FINANCIAL SUMMARY ---")
     print(f"  Deposit        : ${initial_equity:,.0f}")
-    print(f"  Profit         : ${net_profit:,.0f} ({cum_tpsl[-1]*100:.1f}%)")
+    print(f"  Net Profit     : ${net_profit:,.0f} ({(final_equity/initial_equity - 1)*100:.1f}%)")
     print(f"  Total Balance  : ${final_equity:,.0f}")
+    print(f"  Total Pips     : {total_pips:,.1f}")
     print(f"")
+    print(f"  --- POSITION SIZING ---")
+    print(f"  Avg Lots       : {avg_lots:.2f} ({avg_lots*contract_size:,.0f} units)")
+    print(f"  Max Lots       : {max_lots_used:.2f} ({max_lots_used*contract_size:,.0f} units)")
+    print(f"  Avg SL/TP      : {avg_sl_pips:.1f} / {avg_tp_pips:.1f} pips")
+    print(f"  Avg Win        : ${avg_win_dollars:,.2f} ({avg_win_pips:.1f} pips)")
+    print(f"  Avg Loss       : ${avg_loss_dollars:,.2f} ({avg_loss_pips:.1f} pips)")
+    print(f"  W/L Ratio      : {wl_ratio_pips:.2f}x (pips)")
+    print(f"")
+    long_wr = long_wins / (long_wins + long_losses) * 100 if (long_wins + long_losses) > 0 else 0.0
+    short_wr = short_wins / (short_wins + short_losses) * 100 if (short_wins + short_losses) > 0 else 0.0
+
     print(f"  --- PERFORMANCE ---")
-    print(f"  Profit Factor  : {pf:.2f}")
+    print(f"  Profit Factor  : {pf_dollars:.2f}")
     print(f"  Sharpe Ratio   : {sharpe:.2f}")
-    print(f"  Max Drawdown   : {abs(md)*100:.1f}% (${abs(md)*initial_equity:,.0f})")
-    print(f"  Win Rate       : {wr:.1f}%")
-    print(f"  Avg Win / Loss : {avg_win:.3f}% / {avg_loss:.3f}% (W/L={wl_ratio:.2f}x)")
-    print(f"  Trades         : {n_trades} / {len(traded_mask)} days ({trade_freq:.1f}%)")
-    print(f"  Buy & Hold     : {cum_hold[-1]*100:.1f}% (${initial_equity*(1+cum_hold[-1]):,.0f})")
+    print(f"  Max Drawdown   : {abs(md_pct)*100:.1f}% (${abs(md_dollars_exact):,.0f})")
+    print(f"  Win Rate       : {wr:.1f}% ({wins}/{n_trades})")
+    print(f"  LONG Win Rate  : {long_wr:.1f}% ({long_wins}/{long_wins+long_losses})")
+    print(f"  SHORT Win Rate : {short_wr:.1f}% ({short_wins}/{short_wins+short_losses})")
+    print(f"  Trades         : {n_trades} / {n_total} days ({trade_freq:.1f}%)")
+    print(f"  LONG / SHORT   : {long_count} / {short_count}")
+    print(f"  Buy & Hold     : {cum_hold[-1]*100:.1f}% (${hold_final:,.0f})")
     print(f"{'='*70}")
 
     # Save CSV
@@ -255,14 +359,14 @@ def run_backtest():
 
     results = pd.DataFrame({
         "date": dates,
-        "actual_return": actual_returns,
-        "dir_prob": dir_probs,
-        "signal": signals,
-        "pos_fraction": pos_fractions,
-        "return_tpsl": returns_tpsl,
-        "cum_tpsl": cum_tpsl,
+        "equity": all_equity,
+        "dir_prob": all_probs_tracked,
+        "signal": all_signals,
+        "lots": all_lots,
+        "pips": all_pips,
+        "pnl": all_pnl,
+        "actual_return": actual_returns_pct,
         "cum_hold": cum_hold,
-        "equity": initial_equity * (1 + cum_tpsl),
     })
     csv_path = os.path.join(bt_dir, "backtest_results.csv")
     results.to_csv(csv_path, index=False)
@@ -279,14 +383,15 @@ def run_backtest():
 
     # 1. Equity Curve
     ax1 = fig.add_subplot(gs[0, :])
-    ax1.plot(dates, initial_equity * (1 + cum_tpsl), label="TP/SL Strategy", color="green", linewidth=2.0)
+    ax1.plot(dates, all_equity, label="TP/SL Strategy", color="green", linewidth=2.0)
     ax1.plot(dates, initial_equity * (1 + cum_hold), label="Buy & Hold", color="gray", linewidth=1.0, linestyle="--")
     ax1.axhline(initial_equity, color="black", linewidth=0.5, alpha=0.5)
-    ax1.set_title(f"Equity Curve | Net: ${net_profit:,.0f} ({cum_tpsl[-1]*100:.1f}%) | PF={pf:.2f} | Sharpe={sharpe:.2f}",
+    ax1.set_title(f"Три солдата | Net: ${net_profit:,.0f} ({(final_equity/initial_equity-1)*100:.1f}%) | PF={pf_dollars:.2f} | Sharpe={sharpe:.2f}",
                   fontsize=14, fontweight="bold")
     ax1.set_ylabel("Equity ($)")
     ax1.legend(loc="upper left", fontsize=10)
     ax1.grid(True, alpha=0.3)
+    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f"${x:,.0f}"))
     ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
     plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
 
@@ -307,9 +412,9 @@ def run_backtest():
 
     # 3. Probability Distribution
     ax3 = fig.add_subplot(gs[1, 1])
-    up_mask = actual_returns > 0
-    ax3.hist(dir_probs[up_mask], bins=50, alpha=0.6, label="Actual UP", color="green", density=True)
-    ax3.hist(dir_probs[~up_mask], bins=50, alpha=0.6, label="Actual DOWN", color="red", density=True)
+    up_mask = actual_returns_pct > 0
+    ax3.hist(all_probs_tracked[up_mask], bins=50, alpha=0.6, label="Actual UP", color="green", density=True)
+    ax3.hist(all_probs_tracked[~up_mask], bins=50, alpha=0.6, label="Actual DOWN", color="red", density=True)
     ax3.axvline(no_trade_high, color="green", linestyle="-", linewidth=1.5, label=f"BUY >{no_trade_high}")
     ax3.axvline(no_trade_low, color="red", linestyle="-", linewidth=1.5, label=f"SELL <{no_trade_low}")
     ax3.axvspan(no_trade_low, no_trade_high, alpha=0.15, color="gray", label="No-Trade")
@@ -333,37 +438,39 @@ def run_backtest():
 
     # 5. Drawdown
     ax5 = fig.add_subplot(gs[2, 1])
-    equity = initial_equity * (1 + cum_tpsl)
-    running_max = np.maximum.accumulate(equity)
-    drawdown_pct = (equity - running_max) / running_max * 100
+    running_max = np.maximum.accumulate(all_equity)
+    drawdown_pct = (all_equity - running_max) / running_max * 100
     ax5.fill_between(dates, drawdown_pct, 0, color="red", alpha=0.4)
-    ax5.set_title(f"Drawdown (Max: {abs(md)*100:.1f}%)", fontsize=12, fontweight="bold")
+    ax5.set_title(f"Drawdown (Max: {abs(md_pct)*100:.1f}% / ${abs(md_dollars_exact):,.0f})", fontsize=12, fontweight="bold")
     ax5.set_ylabel("Drawdown %")
     ax5.grid(True, alpha=0.3)
     ax5.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
     plt.setp(ax5.xaxis.get_majorticklabels(), rotation=45)
 
-    # 6. Rolling Trade Stats
+    # 6. Pips per trade
     ax6 = fig.add_subplot(gs[3, 0])
-    window = 30
-    rolling_wr = pd.Series(wins.tolist() + [0]*(len(returns_tpsl)-len(wins)),
-                            index=dates).rolling(window).mean().values * 100 if len(wins) > 0 else np.zeros(len(dates))
-    if len(wins) > 0:
-        trade_rets = pd.Series(returns_tpsl[traded_mask], index=dates[traded_mask])
-        rolling_wr = trade_rets.rolling(window).apply(lambda x: (x > 0).mean() * 100).values
-        ax6.plot(trade_rets.index, rolling_wr, color="green", linewidth=1.0)
-        ax6.axhline(50, color="gray", linestyle="--", linewidth=0.8)
-        ax6.set_title(f"Rolling Win Rate ({window}-day)", fontsize=12, fontweight="bold")
-        ax6.set_ylabel("Win Rate %")
+    trade_mask = all_signals != 0
+    if np.any(trade_mask):
+        trade_pips_full = np.array(all_pips)
+        trade_dates = dates[trade_mask]
+        trade_pips_plot = trade_pips_full[trade_mask]
+        colors_pips = ["green" if p > 0 else "red" for p in trade_pips_plot]
+        ax6.bar(trade_dates, trade_pips_plot, color=colors_pips, alpha=0.7, width=0.8)
+        ax6.axhline(0, color="black", linewidth=0.5)
+        ax6.axhline(avg_win_pips, color="green", linestyle="--", linewidth=0.8, alpha=0.7, label=f"Avg Win {avg_win_pips:.1f}p")
+        ax6.axhline(-avg_loss_pips, color="red", linestyle="--", linewidth=0.8, alpha=0.7, label=f"Avg Loss {avg_loss_pips:.1f}p")
+        ax6.set_title("Pips per Trade", fontsize=12, fontweight="bold")
+        ax6.set_ylabel("Pips")
+        ax6.legend(fontsize=8)
     ax6.grid(True, alpha=0.3)
     ax6.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
     plt.setp(ax6.xaxis.get_majorticklabels(), rotation=45)
 
     # 7. Per-Direction + Summary
     ax7 = fig.add_subplot(gs[3, 1])
-    cats = ["LONG\nPrec", "SHORT\nPrec", "DA\nTraded", "WR%", "W/L\nRatio"]
-    vals = [prec_long, prec_short, da_traded, wr, wl_ratio]
-    colors_bar = ["green", "red", "steelblue", "purple", "orange"]
+    cats = ["LONG\nPrec", "SHORT\nPrec", "DA\nTraded", "Total\nWR", "LONG\nWR", "SHORT\nWR", "W/L\nRatio"]
+    vals = [prec_long, prec_short, da_traded, wr, long_wr, short_wr, wl_ratio_pips]
+    colors_bar = ["green", "red", "steelblue", "purple", "limegreen", "salmon", "orange"]
     bars = ax7.bar(cats, vals, color=colors_bar, alpha=0.7, edgecolor="black")
     for bar, val in zip(bars, vals):
         ax7.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
@@ -382,13 +489,17 @@ def run_backtest():
     return {
         "net_profit": net_profit,
         "final_equity": final_equity,
-        "pf": pf,
+        "pf": pf_dollars,
         "sharpe": sharpe,
-        "max_dd": abs(md),
+        "max_dd_pct": abs(md_pct),
+        "max_dd_dollars": abs(md_dollars_exact),
         "win_rate": wr,
-        "wl_ratio": wl_ratio,
+        "wl_ratio": wl_ratio_pips,
         "n_trades": n_trades,
         "da_traded": da_traded,
+        "total_pips": total_pips,
+        "avg_lots": avg_lots,
+        "max_lots": max_lots_used,
     }
 
 
