@@ -31,12 +31,15 @@ def run_training():
     bt_start = BACKTEST_CONFIG["start_date"]
     if isinstance(bt_start, str):
         bt_start = pd.Timestamp(bt_start)
-    train_mask = feats_df.index < bt_start
-    feats_df = feats_df.loc[train_mask]
-    labels_df = labels_df.loc[train_mask]
-    prices_df = prices_df.loc[prices_df.index.isin(feats_df.index)]
+    use_all_data = os.environ.get("USE_ALL_DATA", "0") == "1"
+    if not use_all_data:
+        train_mask = feats_df.index < bt_start
+        feats_df = feats_df.loc[train_mask]
+        labels_df = labels_df.loc[train_mask]
+        prices_df = prices_df.loc[prices_df.index.isin(feats_df.index)]
 
-    print(f"Train-only dataset: {len(feats_df)} samples (before {bt_start.strftime('%Y-%m-%d')}), {len(FEATURE_COLUMNS)} features")
+    data_desc = "all data" if use_all_data else bt_start.strftime("%Y-%m-%d")
+    print(f"Dataset: {len(feats_df)} samples (before {data_desc}), {len(FEATURE_COLUMNS)} features")
     print(f"Label distribution: UP={np.mean(labels_df['label'] == 1)*100:.1f}%, "
           f"DOWN={np.mean(labels_df['label'] == -1)*100:.1f}%, "
           f"FLAT={np.mean(labels_df['label'] == 0)*100:.1f}%")

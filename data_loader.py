@@ -353,7 +353,6 @@ def engineer_d1_features(d1: pd.DataFrame, macro: pd.DataFrame,
     feats["d1_ret_10"] = close.pct_change(10)
     feats["d1_ret_20"] = close.pct_change(20)
 
-    # Shifted to avoid leakage
     atr_raw = compute_atr(high, low, close, DATA_CONFIG["atr_period"])
     atr_ma = atr_raw.rolling(60, min_periods=1).mean()
     feats["atr_norm"] = (atr_raw / (atr_ma + 1e-10)).shift(1)
@@ -419,7 +418,6 @@ def engineer_d1_features(d1: pd.DataFrame, macro: pd.DataFrame,
         feats["dxy_log_return"] = 0.0
         feats["dxy_momentum"] = 0.0
 
-    # Multi-timeframe intraday features (shifted by 1 day to avoid leakage)
     if intraday_data is not None:
         for tf_name, tf_cols in [("H4", ["h4_ret_last", "h4_ret_3d", "h4_vol_ratio", "h4_range_pct", "h4_body_pct"]),
                                    ("H1", ["h1_ret_last", "h1_vol_ratio", "h1_range_pct"])]:
@@ -479,7 +477,6 @@ def engineer_d1_features(d1: pd.DataFrame, macro: pd.DataFrame,
                      "h1_ret_last", "h1_vol_ratio", "h1_range_pct"]:
             feats[col] = 0.0
 
-    # Economic calendar features (shifted by 1 day)
     if calendar is not None:
         cal_shifted = calendar.shift(1)
         cal_reindexed = cal_shifted.reindex(d1.index).ffill().fillna(0)

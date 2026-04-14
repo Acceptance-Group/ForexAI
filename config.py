@@ -8,7 +8,7 @@ DATA_CONFIG = {
     "lookback": 1,
     "barrier_tp": 0.010,
     "barrier_sl": 0.005,
-    "barrier_max_bars": 12,
+    "barrier_max_bars": 20,
     "no_trade_buy_above": 0.60,
     "no_trade_sell_below": 0.45,
     "atr_period": 14,
@@ -21,6 +21,10 @@ DATA_CONFIG = {
     "session_end_utc": 20,
     "trend_filter": False,
     "entry_on_open": False,
+    "trailing_stop": True,
+    "breakeven_pips": 15,
+    "trail_pips": 10,
+    "max_hold_bars": 10,
 }
 
 FEATURE_COLUMNS = [
@@ -80,7 +84,7 @@ TRAIN_CONFIG = {
 
 RISK_CONFIG = {
     "risk_per_trade": 0.01,
-    "max_leverage": 30.0,
+    "max_leverage": 50.0,
     "initial_equity": 10000.0,
     "pip_value_per_lot": 10.0,
     "lot_step": 0.01,
