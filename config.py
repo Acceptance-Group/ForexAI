@@ -2,62 +2,45 @@ import torch
 
 DATA_CONFIG = {
     "start_date": "2010-01-01",
-    "parquet_path": "data/eurusd_features.parquet",
-    "lookback": 21,
-    "barrier_tp": 0.008,
-    "barrier_sl": 0.008,
-    "barrier_max_days": 10,
-    "temperature": 1.0,
-    "no_trade_low": 0.47,
-    "no_trade_high": 0.53,
+    "end_date": "2026-04-14",
+    "parquet_path": "data/eurusd_d1_features.parquet",
+    "raw_parquet_path": "data/eurusd_d1_raw.parquet",
+    "lookback": 1,
+    "barrier_tp": 0.010,
+    "barrier_sl": 0.005,
+    "barrier_max_bars": 12,
+    "no_trade_buy_above": 0.60,
+    "no_trade_sell_below": 0.45,
     "atr_period": 14,
-    "atr_filter_quantile": 0.05,
     "tp_sl_ratio": 3.5,
-    "min_sl_pips": 20.0,
-    "trend_filter_ma": 0,
+    "min_sl_pips": 40.0,
+    "min_adx": 0.30,
+    "timeframe": "1d",
+    "session_filter": False,
+    "session_start_utc": 7,
+    "session_end_utc": 20,
+    "trend_filter": False,
+    "entry_on_open": False,
 }
 
-RAW_FEATURES = ["EUR_USD", "EUR_USD_High", "EUR_USD_Low", "EUR_USD_Volume", "DXY", "VIX", "T10Y2Y", "FEDFUNDS"]
-
 FEATURE_COLUMNS = [
-    "eur_log_return",
-    "eur_ret_3",
-    "eur_ret_5",
-    "dxy_log_return",
-    "dxy_ret_5",
-    "dxy_ret_20",
-    "fedfunds_diff",
-    "relative_strength",
-    "atr_norm",
-    "macd_hist",
-    "bb_pctb",
-    "adx",
-    "bb_width",
-    "ma_50_ratio",
-    "ma_200_ratio",
+    "d1_log_return", "d1_ret_3", "d1_ret_5", "d1_ret_10", "d1_ret_20",
     "dxy_momentum",
+    "atr_norm", "adx", "rsi",
+    "macd_hist",
+    "body_ratio", "lower_shadow_pct",
+    "vol_sma_ratio",
+    "trend_ma20", "trend_ma50",
+    "vwap_ratio",
+    "gbpusd_ret_1", "gbpusd_ret_5", "gbpusd_corr_20",
+    "usdjpy_ret_1", "usdjpy_ret_5", "usdjpy_corr_20",
+    "h4_ret_last", "h4_ret_3d",
+    "h4_range_pct", "h4_body_pct",
 ]
 
 INPUT_DIM = len(FEATURE_COLUMNS)
 
-FEATURE_WEIGHTS = torch.tensor([
-    2.0,  # eur_log_return
-    1.5,  # eur_ret_3
-    1.2,  # eur_ret_5
-    2.0,  # dxy_log_return
-    1.2,  # dxy_ret_5
-    1.3,  # dxy_ret_20
-    1.0,  # fedfunds_diff
-    1.5,  # relative_strength
-    1.0,  # atr_norm
-    1.5,  # macd_hist
-    1.5,  # bb_pctb
-    1.5,  # adx
-    1.5,  # bb_width
-    1.5,  # ma_50_ratio
-    1.5,  # ma_200_ratio
-    1.3,  # dxy_momentum
-])
+FEATURE_WEIGHTS = torch.tensor([1.0] * INPUT_DIM)
 
 YFINANCE_TICKERS = {
     "EUR_USD": "EURUSD=X",
@@ -72,42 +55,54 @@ FRED_SERIES = {
 
 MODEL_CONFIG = {
     "input_dim": INPUT_DIM,
-    "hidden_dim": 64,
+    "hidden_dim": 32,
     "n_layers": 2,
-    "dropout": 0.20,
+    "dropout": 0.30,
     "n_heads": 4,
-    "temperature": 1.0,
+    "temperature": 0.35,
 }
 
 TRAIN_CONFIG = {
-    "epochs": 400,
+    "epochs": 300,
     "batch_size": 256,
-    "learning_rate": 2e-3,
-    "weight_decay": 1e-4,
-    "patience": 50,
+    "learning_rate": 1.5e-3,
+    "weight_decay": 5e-4,
+    "patience": 30,
     "n_splits": 5,
-    "purge_gap": 5,
+    "purge_gap": 2,
     "focal_alpha": 0.50,
-    "focal_gamma": 2.0,
-    "label_sharpening": 0.10,
+    "focal_gamma": 2.5,
+    "label_sharpening": 0.15,
+    "walk_forward_months": 12,
+    "val_months": 3,
+    "step_months": 3,
 }
 
 RISK_CONFIG = {
-    "risk_per_trade": 0.02,
+    "risk_per_trade": 0.01,
     "max_leverage": 30.0,
     "initial_equity": 10000.0,
     "pip_value_per_lot": 10.0,
     "lot_step": 0.01,
     "min_lots": 0.01,
     "contract_size": 100000,
+    "spread_pips": 1.0,
+    "commission_per_lot": 3.5,
+    "compound": False,
 }
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 BACKTEST_CONFIG = {
-    "start_date": "2025-01-01",
-    "end_date": "2026-01-01",
+    "start_date": "2024-01-01",
+    "end_date": "2026-04-14",
 }
 
 MODEL_SAVE_PATH = "models/forex_predictor.pth"
 SCALER_SAVE_PATH = "models/scaler.pkl"
+
+MT5_CONFIG = {
+    "path": r"C:\Program Files\MetaTrader 5\terminal64.exe",
+    "symbol": "EURUSD",
+    "magic_number": 123456,
+}

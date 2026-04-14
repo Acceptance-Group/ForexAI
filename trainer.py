@@ -5,10 +5,9 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import TimeSeriesSplit
 
 from config import (
-    TRAIN_CONFIG, DATA_CONFIG, DEVICE,
+    TRAIN_CONFIG, DATA_CONFIG, DEVICE, BACKTEST_CONFIG,
     MODEL_SAVE_PATH, SCALER_SAVE_PATH,
     FEATURE_COLUMNS, FEATURE_WEIGHTS,
 )
@@ -40,35 +39,6 @@ def create_sequences(features_np, features_df, labels_df, lookback, label_sharpe
     return np.array(X), np.array(y_label)
 
 
-def train_one_epoch(model, loader, criterion, optimizer):
-    model.train()
-    total_loss = 0.0
-    n_batches = 0
-    correct = 0
-    total = 0
-    for X_batch, y_label_batch in loader:
-        X_batch = X_batch.to(DEVICE)
-        y_label_batch = y_label_batch.to(DEVICE)
-
-        optimizer.zero_grad()
-        logits = model(X_batch)
-        loss = criterion(logits, y_label_batch)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-
-        with torch.no_grad():
-            probs = model.predict_proba_raw(X_batch)
-            preds = (probs > 0.5).float()
-            correct += (preds == y_label_batch).sum().item()
-            total += y_label_batch.size(0)
-
-        total_loss += loss.item()
-        n_batches += 1
-
-    return total_loss / n_batches, correct / total * 100
-
-
 def evaluate(model, loader):
     model.eval()
     all_probs = []
@@ -97,39 +67,32 @@ def evaluate(model, loader):
 
     prob_std = np.std(all_probs)
     prob_mean = np.mean(all_probs)
-    prob_range = (np.min(all_probs), np.max(all_probs))
 
-    return da, da_high, pct_high, prob_std, prob_mean, prob_range
+    return da, da_high, pct_high, prob_std, prob_mean
 
 
 def run_training():
-    feats_df = load_dataset()
-    if feats_df.empty:
-        feats_df = build_dataset()
-
-    start_date = DATA_CONFIG["start_date"]
-    if isinstance(start_date, str):
-        start_date = pd.Timestamp(start_date)
-
+    feats_df = build_dataset(force_download=True)
     prices_df = load_raw_prices()
     labels_df = load_labels()
 
     common_idx = feats_df.index.intersection(labels_df.index)
     feats_df = feats_df.loc[common_idx]
     labels_df = labels_df.loc[common_idx]
-
     price_common = feats_df.index.intersection(prices_df.index)
     feats_df = feats_df.loc[price_common]
     labels_df = labels_df.loc[price_common]
     prices_df = prices_df.loc[price_common]
 
-    train_mask = feats_df.index >= start_date
-    feats_df = feats_df[train_mask]
-    labels_df = labels_df[train_mask]
-    prices_df = prices_df.loc[feats_df.index]
+    bt_start = BACKTEST_CONFIG["start_date"]
+    if isinstance(bt_start, str):
+        bt_start = pd.Timestamp(bt_start)
+    train_mask = feats_df.index < bt_start
+    feats_df = feats_df.loc[train_mask]
+    labels_df = labels_df.loc[train_mask]
+    prices_df = prices_df.loc[prices_df.index.isin(feats_df.index)]
 
-    print(f"Dataset: {len(feats_df)} samples, {len(FEATURE_COLUMNS)} features")
-    print(f"Features: {FEATURE_COLUMNS}")
+    print(f"Train-only dataset: {len(feats_df)} samples (before {bt_start.strftime('%Y-%m-%d')}), {len(FEATURE_COLUMNS)} features")
     print(f"Label distribution: UP={np.mean(labels_df['label'] == 1)*100:.1f}%, "
           f"DOWN={np.mean(labels_df['label'] == -1)*100:.1f}%, "
           f"FLAT={np.mean(labels_df['label'] == 0)*100:.1f}%")
@@ -139,53 +102,73 @@ def run_training():
     label_sharpening = TRAIN_CONFIG["label_sharpening"]
 
     scaler = StandardScaler()
-    train_end = int(len(feats_df) * 0.8)
-    scaler.fit(feats_df.values[:train_end])
+    scaler.fit(feats_df.values)
     scaled = scaler.transform(feats_df.values)
 
     os.makedirs(os.path.dirname(SCALER_SAVE_PATH), exist_ok=True)
     with open(SCALER_SAVE_PATH, "wb") as f:
         pickle.dump(scaler, f)
 
-    X_all, y_label_all = create_sequences(
-        scaled, feats_df, labels_df, lookback, label_sharpening
-    )
+    X_all, y_label_all = create_sequences(scaled, feats_df, labels_df, lookback, label_sharpening)
 
     print(f"Sequences: {X_all.shape}, Labels: {np.mean(y_label_all)*100:.1f}% UP")
-    print(f"Label sharpening: {label_sharpening}")
-    print(f"Temperature: {DATA_CONFIG['temperature']}")
 
-    tscv = TimeSeriesSplit(n_splits=TRAIN_CONFIG["n_splits"])
+    dates = feats_df.index[lookback:lookback + len(X_all)]
 
-    best_da = 0.0
-    patience_counter = 0
+    wf_months = TRAIN_CONFIG["walk_forward_months"]
+    val_months = TRAIN_CONFIG["val_months"]
+    step_months = TRAIN_CONFIG["step_months"]
 
-    model = ForexClassifier(feature_weights=FEATURE_WEIGHTS).to(DEVICE)
-    criterion = FocalLoss(
-        alpha=TRAIN_CONFIG["focal_alpha"],
-        gamma=TRAIN_CONFIG["focal_gamma"]
-    ).to(DEVICE)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=TRAIN_CONFIG["learning_rate"],
-        weight_decay=TRAIN_CONFIG["weight_decay"],
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=TRAIN_CONFIG["epochs"], eta_min=1e-6
-    )
-    warmup_epochs = 5
+    fold_results = []
+    best_da_overall = 0.0
 
-    for fold, (train_idx, val_idx) in enumerate(tscv.split(X_all)):
-        purge = max(0, min(val_idx) - purge_gap)
-        train_idx_purged = train_idx[train_idx < purge]
-        if len(train_idx_purged) < 100:
-            train_idx_purged = train_idx
+    start_date = dates[0]
+    end_date = dates[-1]
 
+    first_val_start = start_date + pd.DateOffset(months=wf_months)
+    fold = 0
+    current_val_start = first_val_start
+
+    while current_val_start + pd.DateOffset(months=val_months) <= end_date + pd.DateOffset(days=1):
+        current_val_end = current_val_start + pd.DateOffset(months=val_months)
+
+        train_mask = dates < current_val_start
+        val_mask = (dates >= current_val_start) & (dates < current_val_end)
+
+        if train_mask.sum() < 500 or val_mask.sum() < 50:
+            current_val_start += pd.DateOffset(months=step_months)
+            continue
+
+        train_indices = np.where(train_mask)[0]
+        val_indices = np.where(val_mask)[0]
+
+        purge_start = val_indices[0] - purge_gap
+        train_indices = train_indices[train_indices < purge_start]
+
+        if len(train_indices) < 200 or len(val_indices) < 30:
+            current_val_start += pd.DateOffset(months=step_months)
+            continue
+
+        X_train = torch.tensor(X_all[train_indices], dtype=torch.float32)
+        y_train = torch.tensor(y_label_all[train_indices], dtype=torch.float32)
+        X_val = torch.tensor(X_all[val_indices], dtype=torch.float32)
+        y_val = torch.tensor(y_label_all[val_indices], dtype=torch.float32)
+
+        fold += 1
         print(f"\n{'='*65}")
-        print(f"Fold {fold + 1}/{TRAIN_CONFIG['n_splits']}")
-        print(f"Train: {len(train_idx_purged)}, Val: {len(val_idx)}")
+        print(f"Fold {fold}: Train {len(train_indices)} | Val {len(val_indices)}")
+        print(f"  Train: {dates[train_indices[0]].strftime('%Y-%m-%d')} - {dates[train_indices[-1]].strftime('%Y-%m-%d')}")
+        print(f"  Val:   {dates[val_indices[0]].strftime('%Y-%m-%d')} - {dates[val_indices[-1]].strftime('%Y-%m-%d')}")
 
-        
+        train_loader = torch.utils.data.DataLoader(
+            torch.utils.data.TensorDataset(X_train, y_train),
+            batch_size=TRAIN_CONFIG["batch_size"], shuffle=True,
+        )
+        val_loader = torch.utils.data.DataLoader(
+            torch.utils.data.TensorDataset(X_val, y_val),
+            batch_size=TRAIN_CONFIG["batch_size"], shuffle=False,
+        )
+
         model = ForexClassifier(feature_weights=FEATURE_WEIGHTS).to(DEVICE)
         criterion = FocalLoss(
             alpha=TRAIN_CONFIG["focal_alpha"],
@@ -199,23 +182,10 @@ def run_training():
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=TRAIN_CONFIG["epochs"], eta_min=1e-6
         )
-        warmup_epochs = 5
+
         best_da_fold = 0.0
         patience_counter = 0
-
-        X_train = torch.tensor(X_all[train_idx_purged], dtype=torch.float32)
-        y_train = torch.tensor(y_label_all[train_idx_purged], dtype=torch.float32)
-        X_val = torch.tensor(X_all[val_idx], dtype=torch.float32)
-        y_val = torch.tensor(y_label_all[val_idx], dtype=torch.float32)
-
-        train_loader = torch.utils.data.DataLoader(
-            torch.utils.data.TensorDataset(X_train, y_train),
-            batch_size=TRAIN_CONFIG["batch_size"], shuffle=True,
-        )
-        val_loader = torch.utils.data.DataLoader(
-            torch.utils.data.TensorDataset(X_val, y_val),
-            batch_size=TRAIN_CONFIG["batch_size"], shuffle=False,
-        )
+        warmup_epochs = 5
 
         for epoch in range(1, TRAIN_CONFIG["epochs"] + 1):
             if epoch <= warmup_epochs:
@@ -241,38 +211,68 @@ def run_training():
                 n_batches += 1
 
             scheduler.step()
+            val_da, val_da_high, pct_high, prob_std, prob_mean = evaluate(model, val_loader)
 
-            train_loss = total_loss / n_batches
-
-            val_da, val_da_high, pct_high, prob_std, prob_mean, prob_range = evaluate(model, val_loader)
-
-            if epoch % 10 == 0:
+            if epoch % 20 == 0:
                 lr_current = optimizer.param_groups[0]['lr']
-                print(f"Epoch {epoch:3d} | Loss={train_loss:.4f} | "
+                print(f"  Epoch {epoch:3d} | Loss={total_loss/n_batches:.4f} | "
                       f"Val_DA={val_da:.1f}% | DA_hi={val_da_high:.1f}% ({pct_high:.0f}%) | "
-                      f"Prob: mean={prob_mean:.3f} std={prob_std:.4f} "
-                      f"[{prob_range[0]:.3f},{prob_range[1]:.3f}] | LR={lr_current:.2e}")
+                      f"Prob: mean={prob_mean:.3f} std={prob_std:.4f} | LR={lr_current:.2e}")
 
             if val_da > best_da_fold:
                 best_da_fold = val_da
                 patience_counter = 0
-                if val_da > best_da:
-                    best_da = val_da
+                if val_da > best_da_overall:
+                    best_da_overall = val_da
                     os.makedirs(os.path.dirname(MODEL_SAVE_PATH), exist_ok=True)
                     torch.save(model.state_dict(), MODEL_SAVE_PATH)
             else:
                 patience_counter += 1
                 if patience_counter >= TRAIN_CONFIG["patience"]:
-                    print(f"Early stopping at epoch {epoch}")
+                    print(f"  Early stopping at epoch {epoch}")
                     break
 
-    
-    print(f"\nLoading best saved model (Best Val DA={best_da:.1f}%)...")
+        fold_results.append({"fold": fold, "best_da": best_da_fold})
+        print(f"  Fold {fold} Best DA: {best_da_fold:.1f}%")
+
+        current_val_start += pd.DateOffset(months=step_months)
+
+    print(f"\n{'='*65}")
+    print(f"Walk-Forward Results ({fold} folds):")
+    for fr in fold_results:
+        print(f"  Fold {fr['fold']}: DA={fr['best_da']:.1f}%")
+    avg_da = np.mean([fr["best_da"] for fr in fold_results])
+    print(f"  Average DA: {avg_da:.1f}%")
+    print(f"  Best DA: {best_da_overall:.1f}%")
+
+    print(f"\nLoading best model (Best DA={best_da_overall:.1f}%)...")
     model = ForexClassifier(feature_weights=FEATURE_WEIGHTS).to(DEVICE)
     model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=DEVICE, weights_only=True))
     model.eval()
 
-    
+    with torch.no_grad():
+        X_check = torch.tensor(X_all[-500:], dtype=torch.float32).to(DEVICE)
+        probs = model.predict_proba(X_check).detach().cpu().numpy()
+    y_check = y_label_all[-500:]
+    preds = (probs > 0.5).astype(float)
+    da = np.mean(preds == y_check) * 100
+
+    if da < 35.0:
+        print(f"\n*** SIGNAL INVERSION (DA={da:.1f}%) ***")
+        with torch.no_grad():
+            for name, param in model.classifier.named_parameters():
+                if 'weight' in name:
+                    param.data = -param.data
+                elif 'bias' in name:
+                    param.data = -param.data
+        probs_after = model.predict_proba(X_check).detach().cpu().numpy()
+        preds_after = (probs_after > 0.5).astype(float)
+        da_after = np.mean(preds_after == y_check) * 100
+        print(f"  DA after correction: {da_after:.1f}%")
+        torch.save(model.state_dict(), MODEL_SAVE_PATH)
+    else:
+        print(f"Signal direction OK (DA={da:.1f}%)")
+
     print("\nComputing feature importance...")
     n_imp = min(500, len(X_all))
     X_base = torch.tensor(X_all[:n_imp], dtype=torch.float32).to(DEVICE)
@@ -283,10 +283,10 @@ def run_training():
         base_preds = (base_probs > 0.5).astype(float)
         base_acc = np.mean(base_preds == y_base_np)
 
-    importance = np.zeros(X_all.shape[2])
-    for feat_idx in range(X_all.shape[2]):
+    importance = np.zeros(len(FEATURE_COLUMNS))
+    for feat_idx in range(len(FEATURE_COLUMNS)):
         drops = []
-        for _ in range(5):
+        for _ in range(3):
             X_perm = X_all[:n_imp].copy()
             col = X_perm[:, :, feat_idx].flatten()
             np.random.shuffle(col)
@@ -301,51 +301,14 @@ def run_training():
 
         importance[feat_idx] = base_acc - np.mean(drops)
 
-    print("\nFeature Importance (accuracy drop when permuted):")
+    print("\nFeature Importance:")
     sorted_pairs = sorted(zip(FEATURE_COLUMNS, importance), key=lambda x: -x[1])
     for fname, imp in sorted_pairs:
         bar = "#" * max(0, int(abs(imp) * 1000))
         marker = "+" if imp > 0 else "-"
         print(f"  {fname:20s} {marker}{abs(imp):.4f} {bar}")
 
-    print(f"\nFeature Weights (input scaling):")
-    weights = model.feature_scale.cpu().numpy()
-    for fname, w in sorted(zip(FEATURE_COLUMNS, weights), key=lambda x: -x[1]):
-        bar = "#" * max(0, int(w * 20))
-        print(f"  {fname:20s} {w:.2f} {bar}")
-
-    
-    with torch.no_grad():
-        X_check = torch.tensor(X_all[-500:], dtype=torch.float32).to(DEVICE)
-        probs = model.predict_proba(X_check).detach().cpu().numpy()
-    y_check = y_label_all[-500:]
-    preds = (probs > 0.5).astype(float)
-    da = np.mean(preds == y_check) * 100
-
-    if da < 35.0:
-        print(f"\n*** SIGNAL INVERSION DETECTED (DA={da:.1f}%) ***")
-        print(f"    Flipping classifier head weights to correct direction...")
-        with torch.no_grad():
-            for name, param in model.classifier.named_parameters():
-                if 'weight' in name:
-                    param.data = -param.data
-                elif 'bias' in name:
-                    param.data = -param.data
-
-        probs_after = model.predict_proba(X_check).detach().cpu().numpy()
-        preds_after = (probs_after > 0.5).astype(float)
-        da_after = np.mean(preds_after == y_check) * 100
-        print(f"    DA after correction: {da_after:.1f}%")
-
-        os.makedirs(os.path.dirname(MODEL_SAVE_PATH), exist_ok=True)
-        torch.save(model.state_dict(), MODEL_SAVE_PATH)
-        print(f"    Model re-saved with corrected weights.")
-    else:
-        print(f"\nSignal direction OK (DA={da:.1f}%)")
-
-    print(f"\nTraining complete. Best Val DA={best_da:.1f}%")
-    print(f"Temperature: {model.temperature}")
-    print(f"Model saved to {MODEL_SAVE_PATH}")
+    print(f"\nTraining complete. Best Val DA={best_da_overall:.1f}%")
     return model, scaler
 
 

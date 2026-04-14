@@ -23,8 +23,9 @@ def main():
         run_backtest()
 
     elif args.command == "predict":
-        from inference import run_inference
-        run_inference()
+        from data_loader import build_dataset, load_raw_prices
+        from trainer import run_training
+        print("Use: python trader.py signal  — for live signal generation")
 
 
 if __name__ == "__main__":
