@@ -182,3 +182,5 @@ cython_debug/
 /data
 /models
 /backtest
+
+signal_log.json
