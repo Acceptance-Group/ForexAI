@@ -5,17 +5,15 @@ import datetime
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-import MetaTrader5 as mt5
 
 from config import (
     DATA_CONFIG, RISK_CONFIG, MODEL_SAVE_PATH, SCALER_SAVE_PATH,
     FEATURE_COLUMNS,
 )
 from data_loader import build_dataset, load_raw_prices, compute_atr, compute_adx
+from broker import init_broker, get_broker, shutdown_broker
 
 SYMBOL = "EURUSD"
-MAGIC_NUMBER = 123456
-MT5_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 
 VOL_MODEL_PATH = "models/vol_model.json"
 VOL_SCALER_PATH = "models/vol_scaler.pkl"
@@ -28,101 +26,85 @@ MAX_HOLD_BARS = DATA_CONFIG.get("max_hold_bars", 10)
 CHECK_INTERVAL_SEC = 60
 
 
-def connect_mt5(path=MT5_PATH):
-    if not mt5.initialize(path=path):
-        print(f"MT5 init failed: {mt5.last_error()}")
-        return False
-    account = mt5.account_info()
-    if account is None:
-        print(f"MT5 account_info failed: {mt5.last_error()}")
-        return False
-    print(f"Connected: {account.server} | Login: {account.login} | Balance: ${account.balance:,.2f} | Equity: ${account.equity:,.2f}")
-    return True
+def connect_broker():
+    return init_broker()
 
 
-def disconnect_mt5():
-    mt5.shutdown()
+def disconnect_broker():
+    shutdown_broker()
 
 
 def get_symbol_info(symbol=SYMBOL):
-    info = mt5.symbol_info(symbol)
-    if info is None:
-        print(f"Symbol {symbol} not found")
+    try:
+        broker = get_broker()
+        info = broker.symbol_info(symbol)
+        if info is None:
+            return None
+        return info
+    except Exception:
         return None
-    if not info.visible:
-        mt5.symbol_select(symbol, True)
-    return info
 
 
 def get_current_price(symbol=SYMBOL):
-    tick = mt5.symbol_info_tick(symbol)
-    if tick is None:
+    try:
+        broker = get_broker()
+        tick = broker.symbol_info_tick(symbol)
+        if tick is None:
+            return None, None
+        return tick.ask, tick.bid
+    except Exception:
         return None, None
-    return tick.ask, tick.bid
 
 
 def get_open_position(symbol=SYMBOL):
-    positions = mt5.positions_get(symbol=symbol)
-    if positions is None or len(positions) == 0:
+    try:
+        broker = get_broker()
+        positions = broker.positions_get(symbol=symbol)
+        if positions is None or len(positions) == 0:
+            return None
+        return positions[0]
+    except Exception:
         return None
-    return positions[0]
 
 
 def close_position(position):
-    close_type = mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-    price = mt5.symbol_info_tick(position.symbol).bid if position.type == mt5.ORDER_TYPE_BUY \
-        else mt5.symbol_info_tick(position.symbol).ask
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": position.symbol,
-        "volume": position.volume,
-        "type": close_type,
-        "position": position.ticket,
-        "price": price,
-        "deviation": 20,
-        "magic": MAGIC_NUMBER,
-        "comment": "d1_ts_close",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-    result = mt5.order_send(request)
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        print(f"Close failed: {result.retcode} - {result.comment}")
+    try:
+        broker = get_broker()
+        result = broker.close_position(position.ticket, symbol=position.symbol)
+        if result is None or (hasattr(result, 'retcode') and result.retcode != 1):
+            print(f"Close failed: {result}")
+            return False
+
+        pnl = position.profit
+        pos_type = "BUY" if position.type == 0 else "SELL"
+        print(f"  Closed {pos_type} #{position.ticket} {position.volume:.2f} lots @ {position.price_current:.5f} P&L=${pnl:.2f}")
+        return True
+    except Exception as e:
+        print(f"Close error: {e}")
         return False
-    pnl = position.profit
-    pos_type = "BUY" if position.type == mt5.ORDER_TYPE_BUY else "SELL"
-    print(f"  Closed {pos_type} #{position.ticket} {position.volume:.2f} lots "
-          f"@ {price:.5f} P&L=${pnl:.2f}")
-    return True
 
 
 def modify_sl(position, new_sl, symbol=SYMBOL):
-    symbol_info = get_symbol_info(symbol)
-    if symbol_info is None:
+    try:
+        broker = get_broker()
+        digits = broker.get_symbol_digits(symbol)
+        result = broker.modify_position(
+            position.ticket,
+            sl=float(round(new_sl, digits)),
+            tp=float(round(position.tp, digits)),
+        )
+        if result is None or (hasattr(result, 'retcode') and result.retcode != 1):
+            print(f"  SL modify failed")
+            return False
+        return True
+    except Exception as e:
+        print(f"  SL modify error: {e}")
         return False
-    digits = symbol_info.digits
-    request = {
-        "action": mt5.TRADE_ACTION_SLTP,
-        "symbol": symbol,
-        "volume": position.volume,
-        "position": position.ticket,
-        "sl": float(round(new_sl, digits)),
-        "tp": float(round(position.tp, digits)),
-        "magic": MAGIC_NUMBER,
-        "comment": "d1_trail",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-    result = mt5.order_send(request)
-    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-        print(f"  SL modify failed: {result.retcode if result else 'None'}")
-        return False
-    return True
 
 
 def build_signal():
     print("Building D1 signal (XGBoost + Vol Filter + Trailing Stop)...")
-    feats_df = build_dataset(force_download=True)
+    feats_df = build_dataset(force_download=False)
     prices_df = load_raw_prices()
     common_idx = feats_df.index.intersection(prices_df.index)
     feats_df = feats_df.loc[common_idx]
@@ -141,9 +123,10 @@ def build_signal():
         vol_scaler = pickle.load(f)
     vol_scaled = vol_scaler.transform(feats_df.values)
     vol_pred = vol_model.predict(vol_scaled)
-    vol_median = np.median(vol_pred[:int(len(vol_pred) * 0.7)])
+    vol_pct = pd.Series(vol_pred).rolling(252, min_periods=30).quantile(0.20).values
+    vol_threshold = vol_pct[-1] if not pd.isna(vol_pct[-1]) else np.median(vol_pred)
     current_vol = vol_pred[-1]
-    vol_high = current_vol > vol_median
+    vol_high = current_vol > vol_threshold
 
     close = prices_df["close"].values
     high = prices_df["high"].values
@@ -188,13 +171,13 @@ def build_signal():
         print(f"  ADX {current_adx:.2f} < {min_adx} - filtered")
     if signal != "HOLD" and not vol_high:
         signal = "HOLD"
-        print(f"  Vol filter: {current_vol:.5f} <= median {vol_median:.5f} - filtered")
+        print(f"  Vol filter: {current_vol:.5f} <= threshold {vol_threshold:.5f} - filtered")
 
     print(f"\n{'='*60}")
     print(f"  D1 EURUSD Signal ({datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC)")
     print(f"{'='*60}")
     print(f"  P(UP)          : {dir_prob:.4f}")
-    print(f"  Predicted ATR  : {current_vol:.5f} (median: {vol_median:.5f})")
+    print(f"  Predicted ATR  : {current_vol:.5f} (threshold: {vol_threshold:.5f})")
     print(f"  Vol High       : {vol_high}")
     print(f"  ADX            : {current_adx:.2f}")
     print(f"  ATR/SL/TP      : {atr_pips:.1f} / {sl_pips:.1f} / {tp_pips:.1f} pips ({dyn_tp_sl:.1f}x)")
@@ -215,14 +198,15 @@ def place_order(signal_info, symbol=SYMBOL):
         print("  HOLD - no trade.")
         return None
 
-    symbol_info = get_symbol_info(symbol)
+    broker = get_broker()
+    symbol_info = broker.symbol_info(symbol)
     if symbol_info is None:
         return None
     ask, bid = get_current_price(symbol)
     if ask is None:
         return None
 
-    account = mt5.account_info()
+    account = broker.account_info()
     if account is None:
         return None
 
@@ -238,19 +222,19 @@ def place_order(signal_info, symbol=SYMBOL):
     lots = min(lots, max_lots_val)
     lots = max(RISK_CONFIG["min_lots"], lots)
 
-    digits = symbol_info.digits
-    point = symbol_info.point
+    digits = broker.get_symbol_digits(symbol)
+    point = broker.get_symbol_point(symbol)
     sl_distance = sl_pips * point * 10
     tp_distance = tp_pips * point * 10
 
     if signal == "BUY":
-        order_type = mt5.ORDER_TYPE_BUY
+        order_type = broker.ORDER_TYPE_BUY
         price = ask
         sl_price = round(price - sl_distance, digits)
         tp_price = round(price + tp_distance, digits)
         original_sl = sl_price
     else:
-        order_type = mt5.ORDER_TYPE_SELL
+        order_type = broker.ORDER_TYPE_SELL
         price = bid
         sl_price = round(price + sl_distance, digits)
         tp_price = round(price - tp_distance, digits)
@@ -262,26 +246,19 @@ def place_order(signal_info, symbol=SYMBOL):
     print(f"  Trailing: BE={BREAKEVEN_PIPS}p, Trail={TRAIL_PIPS}p")
 
     request = {
-        "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
         "volume": float(lots),
         "type": order_type,
-        "price": float(price),
         "sl": float(sl_price),
         "tp": float(tp_price),
-        "deviation": 20,
-        "magic": MAGIC_NUMBER,
-        "comment": "d1_ts",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
     }
 
-    result = mt5.order_send(request)
+    result = broker.order_send(request)
     if result is None:
-        print(f"  Order failed: {mt5.last_error()}")
+        print(f"  Order failed")
         return None
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        print(f"  Order rejected: {result.retcode} - {result.comment}")
+    if hasattr(result, 'retcode') and result.retcode != 1:
+        print(f"  Order rejected: {result.comment}")
         return None
 
     print(f"  Executed! Ticket: {result.order}")
@@ -320,19 +297,14 @@ def manage_trailing_stop(order_info, symbol=SYMBOL):
             print("  Position closed (TP/SL hit or manual close)")
             break
 
-        tick = mt5.symbol_info_tick(symbol)
-        if tick is None:
-            time.sleep(CHECK_INTERVAL_SEC)
-            continue
-
-        current_bid = tick.bid
-        current_ask = tick.ask
-        current_price = current_bid if is_buy else current_ask
+        _, bid = get_current_price(symbol)
+        ask, _ = get_current_price(symbol)
+        current_price = bid if is_buy else ask
         current_pnl = position.profit
         elapsed = (datetime.datetime.utcnow() - start_time).total_seconds() / 3600
 
         if is_buy:
-            highest = max(highest, current_bid)
+            highest = max(highest, bid)
             unrealized_pips = (highest - entry) * 10000
             if not be_triggered and unrealized_pips >= BREAKEVEN_PIPS:
                 new_sl = entry + 0.0001
@@ -347,7 +319,7 @@ def manage_trailing_stop(order_info, symbol=SYMBOL):
                     if modify_sl(position, new_sl, symbol):
                         print(f"  [{elapsed:.1f}h] Trail UP: SL={new_sl:.5f} (high={highest:.5f})")
         else:
-            lowest = min(lowest, current_ask)
+            lowest = min(lowest, ask)
             unrealized_pips = (entry - lowest) * 10000
             if not be_triggered and unrealized_pips >= BREAKEVEN_PIPS:
                 new_sl = entry - 0.0001
@@ -370,7 +342,7 @@ def manage_trailing_stop(order_info, symbol=SYMBOL):
         if elapsed % 4 < CHECK_INTERVAL_SEC / 3600:
             pnl_str = f"${current_pnl:+.2f}" if current_pnl else "N/A"
             be_str = "BE" if be_triggered else "--"
-            print(f"  [{elapsed:.1f}h] P&L={pnl_str} | {be_str} | High={'highest' if is_buy else lowest:.5f} | SL={position.sl:.5f}")
+            print(f"  [{elapsed:.1f}h] P&L={pnl_str} | {be_str} | High={highest:.5f if is_buy else lowest} | SL={position.sl:.5f}")
 
         time.sleep(CHECK_INTERVAL_SEC)
 
@@ -382,13 +354,13 @@ def run_trading_cycle():
     if signal == "HOLD":
         position = get_open_position()
         if position is not None:
-            pos_type = "BUY" if position.type == mt5.ORDER_TYPE_BUY else "SELL"
+            pos_type = "BUY" if position.type == 0 else "SELL"
             print(f"  Existing {pos_type}: {position.volume:.2f} lots P&L=${position.profit:.2f}")
         return None
 
     existing = get_open_position()
     if existing is not None:
-        pos_type = "BUY" if existing.type == mt5.ORDER_TYPE_BUY else "SELL"
+        pos_type = "BUY" if existing.type == 0 else "SELL"
         new_signal = signal_info["signal"]
         same_dir = (pos_type == "BUY" and new_signal == "BUY") or \
                     (pos_type == "SELL" and new_signal == "SELL")
@@ -407,18 +379,26 @@ def run_trading_cycle():
 
 def run_bot_d1():
     print("=" * 60)
-    print("  D1 XGBoost + Vol Filter + Trailing Stop Bot")
+    print(" /$$$$$$$$                                       /$$$$$$  /$$$$$$")
+    print("| $$_____/                                      /$$__  $$|_  $$_/")
+    print("| $$     /$$$$$$   /$$$$$$   /$$$$$$  /$$   /$$| $$  \\ $$  | $$  ")
+    print("| $$$$$ /$$__  $$ /$$__  $$ /$$__  $$|  $$ /$$/| $$$$$$$$  | $$  ")
+    print("| $$__/| $$  \\ $$| $$  \\__/| $$$$$$$$ \\  $$$$/ | $$__  $$  | $$  ")
+    print("| $$   | $$  | $$| $$      | $$_____/  >$$  $$ | $$  | $$  | $$  ")
+    print("| $$   |  $$$$$$/| $$      |  $$$$$$$ /$$/\\  $$| $$  | $$ /$$$$$$")
+    print("|__/    \\______/ |__/       \\_______/|__/  \\__/|__/  |__/|______/")
+    print("  powered by moonway")
     print("=" * 60)
     print(f"  Strategy:  BUY>{DATA_CONFIG['no_trade_buy_above']}, SELL<{DATA_CONFIG['no_trade_sell_below']}")
-    print(f"  Vol Filter: ATR_pred > median")
+    print(f"  Vol Filter: ATR_pred > 20th pct")
     print(f"  ADX Filter: >={DATA_CONFIG.get('min_adx', 0.30)}")
     print(f"  TP/SL:      {DATA_CONFIG['tp_sl_ratio']}x dynamic vol-scaled")
     print(f"  Trailing:   BE={BREAKEVEN_PIPS}p / Trail={TRAIL_PIPS}p / Max={MAX_HOLD_BARS} bars")
     print(f"  Risk:        {RISK_CONFIG['risk_per_trade']*100:.1f}% per trade")
     print("=" * 60)
 
-    if not connect_mt5():
-        print("Cannot connect to MT5!")
+    if not init_broker():
+        print("Cannot connect to broker!")
         return
 
     last_trade_date = None
@@ -435,34 +415,33 @@ def run_bot_d1():
             else:
                 position = get_open_position()
                 if position is not None:
-                    pos_type = "BUY" if position.type == mt5.ORDER_TYPE_BUY else "SELL"
-                    manage_existing = False
-
-                    if position.magic == MAGIC_NUMBER:
-                        is_buy = position.type == mt5.ORDER_TYPE_BUY
-                        entry = position.price_open
-                        current_sl = position.sl
-                        current_tp = position.tp
-                        tick = mt5.symbol_info_tick(SYMBOL)
-                        if tick:
-                            be_price = entry + (1 / 10000 if is_buy else -1 / 10000)
-                            be_triggered = (is_buy and current_sl >= be_price) or \
-                                          (not is_buy and current_sl <= be_price)
-                            if be_triggered and is_buy:
-                                high_price = tick.bid
-                                trail_sl = high_price - TRAIL_PIPS / 10000
-                                if trail_sl > current_sl:
-                                    modify_sl(position, trail_sl, SYMBOL)
-                            elif be_triggered and not is_buy:
-                                low_price = tick.ask
-                                trail_sl = low_price + TRAIL_PIPS / 10000
-                                if trail_sl < current_sl:
-                                    modify_sl(position, trail_sl, SYMBOL)
-                            elif not be_triggered:
-                                unrealized = (tick.bid - entry if is_buy else entry - tick.ask) * 10000
-                                if unrealized >= BREAKEVEN_PIPS:
-                                    new_sl = entry + (1 / 10000 if is_buy else -1 / 10000)
-                                    modify_sl(position, new_sl, SYMBOL)
+                    pos_type = "BUY" if position.type == 0 else "SELL"
+                    is_buy = position.type == 0
+                    entry = position.price_open
+                    current_sl = position.sl
+                    current_tp = position.tp
+                    ask, bid = get_current_price()
+                    if ask and bid:
+                        tick_ask = ask
+                        tick_bid = bid
+                        be_price = entry + (1 / 10000 if is_buy else -1 / 10000)
+                        be_triggered = (is_buy and current_sl >= be_price) or \
+                                      (not is_buy and current_sl <= be_price)
+                        if be_triggered and is_buy:
+                            high_price = tick_bid
+                            trail_sl = high_price - TRAIL_PIPS / 10000
+                            if trail_sl > current_sl:
+                                modify_sl(position, trail_sl)
+                        elif be_triggered and not is_buy:
+                            low_price = tick_ask
+                            trail_sl = low_price + TRAIL_PIPS / 10000
+                            if trail_sl < current_sl:
+                                modify_sl(position, trail_sl)
+                        elif not be_triggered:
+                            unrealized = (tick_bid - entry if is_buy else entry - tick_ask) * 10000
+                            if unrealized >= BREAKEVEN_PIPS:
+                                new_sl = entry + (1 / 10000 if is_buy else -1 / 10000)
+                                modify_sl(position, new_sl)
 
                     pnl = position.profit
                     print(f"  [{now.strftime('%H:%M')}] Open {pos_type} P&L=${pnl:.2f}")
@@ -474,41 +453,41 @@ def run_bot_d1():
     except KeyboardInterrupt:
         print("\nBot stopped by user.")
     finally:
-        disconnect_mt5()
+        shutdown_broker()
 
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
         print("Usage:")
-        print("  python trader_d1.py connect   - Test MT5 connection")
+        print("  python trader_d1.py connect   - Test broker connection")
         print("  python trader_d1.py signal     - Get current D1 signal")
-        print("  python trader_d1.py trade       - Execute one trade with trailing stop")
-        print("  python trader_d1.py close       - Close current position")
-        print("  python trader_d1.py bot          - Run D1 trading bot (24/7)")
+        print("  python trader_d1.py trade      - Execute one trade with trailing stop")
+        print("  python trader_d1.py close      - Close current position")
+        print("  python trader_d1.py bot         - Run D1 trading bot (24/7)")
         sys.exit(0)
 
     cmd = sys.argv[1].lower()
     if cmd == "connect":
-        connect_mt5()
-        account = mt5.account_info()
+        init_broker()
+        account = get_broker().account_info()
         print(f"Balance: ${account.balance:,.2f} | Equity: ${account.equity:,.2f}")
-        disconnect_mt5()
+        shutdown_broker()
     elif cmd == "signal":
-        connect_mt5()
+        init_broker()
         build_signal()
-        disconnect_mt5()
+        shutdown_broker()
     elif cmd == "trade":
-        connect_mt5()
+        init_broker()
         run_trading_cycle()
-        disconnect_mt5()
+        shutdown_broker()
     elif cmd == "close":
-        connect_mt5()
+        init_broker()
         pos = get_open_position()
         if pos:
             close_position(pos)
         else:
             print("No position.")
-        disconnect_mt5()
+        shutdown_broker()
     elif cmd == "bot":
         run_bot_d1()

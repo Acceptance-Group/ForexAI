@@ -8,4 +8,5 @@ requests>=2.31.0
 matplotlib>=3.7.0
 xgboost>=2.0.0
 hmmlearn>=0.3.0
-MetaTrader5>=5.0.45
+flask>=3.0.0
+ctrader-open-api>=1.0.0

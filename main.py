@@ -14,7 +14,7 @@ def run(cmd, desc):
 
 
 def fetch():
-    return run("python -c \"from data_loader import build_dataset; build_dataset(force_download=True)\"", "Fetching data from MT5")
+    return run("python -c \"from data_loader import build_dataset; build_dataset(force_download=True)\"", "Fetching data from broker")
 
 
 def train_direction():
@@ -58,7 +58,7 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage:")
         print("  python main.py all       - Fetch data + train all models + backtest")
-        print("  python main.py fetch      - Download fresh data from MT5")
+        print("  python main.py fetch      - Download fresh data from broker")
         print("  python main.py train      - Train direction model only")
         print("  python main.py train_sub - Train sub-models (Vol, HMM, MeanRev)")
         print("  python main.py backtest  - Run backtest with trailing stop")

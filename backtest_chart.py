@@ -56,7 +56,8 @@ def run_full_backtest():
         vol_scaler = pickle.load(f)
     vol_scaled = vol_scaler.transform(feats_df.values)
     vol_preds = vol_model.predict(vol_scaled)
-    atr_pred_median = np.median(vol_preds[:int(len(vol_preds) * 0.7)])
+    vol_percentile_arr = pd.Series(vol_preds).rolling(252, min_periods=30).quantile(0.20).values
+    atr_pred_median = vol_percentile_arr
 
     close = prices_df["close"].values
     high = prices_df["high"].values
@@ -111,7 +112,8 @@ def run_full_backtest():
     for i, idx in enumerate(bt_indices):
         prob = dir_probs[idx]
         vol_pred = vol_preds[idx]
-        vol_high = vol_pred > atr_pred_median
+        vol_median_val = atr_pred_median[idx] if idx < len(atr_pred_median) else vol_pred
+        vol_high = vol_pred > vol_median_val
 
         current_price = close[idx]
         next_price = close[idx + 1]
@@ -338,12 +340,19 @@ def run_full_backtest():
     all_equity = np.array(equity_curve[1:])
 
     print(f"\n{'='*70}")
-    print(f"  BACKTEST RESULTS ({BACKTEST_CONFIG['start_date']} - {BACKTEST_CONFIG['end_date']})")
-    print(f"  Strategy: XGBoost D1 + Vol Filter | Bars: {n_total}")
+    print(" /$$$$$$$$                                       /$$$$$$  /$$$$$$")
+    print("| $$_____/                                      /$$__  $$|_  $$_/")
+    print("| $$     /$$$$$$   /$$$$$$   /$$$$$$  /$$   /$$| $$  \\ $$  | $$  ")
+    print("| $$$$$ /$$__  $$ /$$__  $$ /$$__  $$|  $$ /$$/| $$$$$$$$  | $$  ")
+    print("| $$__/| $$  \\ $$| $$  \\__/| $$$$$$$$ \\  $$$$/ | $$__  $$  | $$  ")
+    print("| $$   | $$  | $$| $$      | $$_____/  >$$  $$ | $$  | $$  | $$  ")
+    print("| $$   |  $$$$$$/| $$      |  $$$$$$$ /$$/\\  $$| $$  | $$ /$$$$$$")
+    print("|__/    \\______/ |__/       \\_______/|__/  \\__/|__/  |__/|______/")
+    print(f"  BACKTEST {BACKTEST_CONFIG['start_date']} - {BACKTEST_CONFIG['end_date']} | Strategy: XGBoost + Vol + Trail | Bars: {n_total}")
     print(f"{'='*70}")
     print(f"  TP/SL Ratio  : {tp_sl_ratio}x (dynamic vol-scaled)")
     print(f"  No-Trade Zone: BUY >{no_trade_buy_above}, SELL <{no_trade_sell_below}")
-    print(f"  Vol Filter   : ATR_pred > median ({n_filtered_vol} filtered)")
+    print(f"  Vol Filter   : ATR_pred > 20th pct ({n_filtered_vol} filtered)")
     print(f"  Risk/Trade   : {risk_per_trade*100:.1f}% | Max Leverage: {max_leverage:.0f}:1")
     print(f"  Spread       : {spread_pips:.1f} pips | Commission: ${commission_per_lot:.1f}/lot")
     print(f"")
@@ -437,11 +446,12 @@ def run_full_backtest():
     ax3.grid(True, alpha=0.3)
 
     ax4 = fig.add_subplot(gs[2, 0])
-    vol_filtered_mask = np.array([vol_preds[idx] > atr_pred_median for idx in bt_indices])
-    vol_filter_colors = ["green" if v else "red" for v in vol_filtered_mask[:len(all_dir_p)]]
+    rolling_medians = np.array([atr_pred_median[idx] if idx < len(atr_pred_median) else np.median(vol_preds[:max(idx,1)]) for idx in bt_indices])
+    vol_filter_colors = ["green" if vol_preds[bt_indices[i]] > rolling_medians[i] else "red" for i in range(len(rolling_medians))]
     ax4.scatter(np.array(all_dir_p), vol_preds[bt_indices[:len(all_dir_p)]],
                 c=vol_filter_colors[:len(all_dir_p)], alpha=0.3, s=10)
-    ax4.axhline(atr_pred_median, color="yellow", linestyle="--", linewidth=1, label=f"Vol Median={atr_pred_median:.5f}")
+    global_median = np.median(vol_preds)
+    ax4.axhline(global_median, color="yellow", linestyle="--", linewidth=1, label=f"Vol Median={global_median:.5f}")
     ax4.axvline(no_trade_buy_above, color="green", linestyle=":", alpha=0.5)
     ax4.axvline(no_trade_sell_below, color="red", linestyle=":", alpha=0.5)
     ax4.set_title("Vol Filter: P(UP) vs Predicted ATR", fontsize=12, fontweight="bold")

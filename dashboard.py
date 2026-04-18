@@ -9,20 +9,18 @@ import pandas as pd
 import xgboost as xgb
 from flask import Flask, render_template_string, jsonify, request
 
-import MetaTrader5 as mt5
 from config import (
     DATA_CONFIG, RISK_CONFIG, MODEL_SAVE_PATH, SCALER_SAVE_PATH,
     FEATURE_COLUMNS, BACKTEST_CONFIG,
 )
 from data_loader import build_dataset, load_raw_prices, compute_atr, compute_adx
+from broker import init_broker, get_broker, shutdown_broker
 
 VOL_MODEL_PATH = "models/vol_model.json"
 VOL_SCALER_PATH = "models/vol_scaler.pkl"
 MEANREV_MODEL_PATH = "models/meanrev_model.json"
 MEANREV_SCALER_PATH = "models/meanrev_scaler.pkl"
-MT5_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 SYMBOL = "EURUSD"
-MAGIC_NUMBER = 123456
 TRADE_LOG = "trade_log.json"
 SIGNAL_LOG = "signal_log.json"
 
@@ -36,31 +34,32 @@ cached_candles = None
 cached_candles_ts = 0
 _cached_analysis = None
 _cached_analysis_ts = 0
-_mt5_lock = threading.Lock()
-_mt5_connected = False
+_broker_lock = threading.Lock()
+_broker_connected = False
 
 
-def ensure_mt5():
-    global _mt5_connected
-    with _mt5_lock:
+def ensure_broker():
+    global _broker_connected
+    with _broker_lock:
         try:
-            info = mt5.account_info()
+            broker = get_broker()
+            info = broker.account_info()
             if info is not None:
-                _mt5_connected = True
+                _broker_connected = True
                 return True
         except Exception:
             pass
         try:
-            ok = mt5.initialize(path=MT5_PATH)
-            if ok:
-                info = mt5.account_info()
+            if init_broker():
+                broker = get_broker()
+                info = broker.account_info()
                 if info is not None:
-                    _mt5_connected = True
-                    print(f"MT5 reconnected: {info.server} Balance=${info.balance:,.2f}")
+                    _broker_connected = True
+                    print(f"Broker connected: {info.server} Balance=${info.balance:,.2f}")
                     return True
         except Exception as e:
-            print(f"MT5 init error: {e}")
-_mt5_connected = False
+            print(f"Broker init error: {e}")
+        _broker_connected = False
 
 
 def _bg_compute_signal():
@@ -297,54 +296,66 @@ def get_chart_analysis(n_bars=200):
         return _cached_analysis or []
 
 
-def get_mt5_info():
-    with _mt5_lock:
+_cached_account = {}
+_cached_account_ts = 0
+_ACCOUNT_CACHE_TTL = 10
+
+
+def get_account_info():
+    global _cached_account, _cached_account_ts
+    now = time.time()
+    if _cached_account and (now - _cached_account_ts) < _ACCOUNT_CACHE_TTL:
+        return _cached_account
+
+    if not _broker_connected:
         try:
-            info = mt5.account_info()
-            if info is None:
-                if not mt5.initialize(path=MT5_PATH):
-                    return {"connected": False}
-                info = mt5.account_info()
-                if info is None:
-                    return {"connected": False}
-            positions = mt5.positions_get(symbol=SYMBOL)
-            pos_list = []
-            if positions:
-                for p in positions:
-                    pos_list.append({
-                        "ticket": p.ticket,
-                        "symbol": p.symbol,
-                        "type": "BUY" if p.type == mt5.ORDER_TYPE_BUY else "SELL",
-                        "volume": p.volume,
-                        "price_open": p.price_open,
-                        "price_current": p.price_current,
-                        "sl": p.sl,
-                        "tp": p.tp,
-                        "profit": p.profit,
-                        "time": datetime.datetime.fromtimestamp(p.time).isoformat(),
-                        "magic": p.magic,
-                    })
-            tick = mt5.symbol_info_tick(SYMBOL)
-            return {
-                "balance": info.balance,
-                "equity": info.equity,
-                "profit": info.profit,
-                "margin": info.margin,
-                "free_margin": info.margin_free,
-                "leverage": info.leverage,
-                "server": info.server,
-                "positions": pos_list,
-                "bid": tick.bid if tick else 0,
-                "ask": tick.ask if tick else 0,
-                "spread": (tick.ask - tick.bid) * 100000 if tick else 0,
-                "connected": True,
-            }
+            with _broker_lock:
+                broker = get_broker()
+                info = broker.account_info()
         except Exception:
-            try:
-                mt5.initialize(path=MT5_PATH)
-            except Exception:
-                pass
-            return {"connected": False}
+            return _cached_account if _cached_account else {"connected": False}
+
+    try:
+        broker = get_broker()
+        info = broker.account_info()
+        if info is None:
+            return _cached_account if _cached_account else {"connected": False}
+        positions = broker.positions_get(symbol=SYMBOL)
+        pos_list = []
+        if positions:
+            for p in positions:
+                pos_list.append({
+                    "ticket": p.ticket,
+                    "symbol": p.symbol,
+                    "type": "BUY" if p.type == 0 else "SELL",
+                    "volume": p.volume,
+                    "price_open": p.price_open,
+                    "price_current": p.price_current,
+                    "sl": p.sl,
+                    "tp": p.tp,
+                    "profit": p.profit,
+                    "time": p.time.isoformat() if p.time and isinstance(p.time, datetime.datetime) else "",
+                })
+        tick = broker.symbol_info_tick(SYMBOL)
+        result = {
+            "balance": info.balance,
+            "equity": info.equity,
+            "profit": info.profit,
+            "margin": info.margin,
+            "free_margin": info.margin_free,
+            "leverage": info.leverage,
+            "server": info.server,
+            "positions": pos_list,
+            "bid": tick.bid if tick else 0,
+            "ask": tick.ask if tick else 0,
+            "spread": (tick.ask - tick.bid) * 100000 if tick else 0,
+            "connected": True,
+        }
+        _cached_account = result
+        _cached_account_ts = now
+        return result
+    except Exception:
+        return _cached_account if _cached_account else {"connected": False}
 
 
 def get_candles(count=200):
@@ -354,11 +365,12 @@ def get_candles(count=200):
         return cached_candles
 
     try:
-        with _mt5_lock:
-            if not _mt5_connected:
-                if not ensure_mt5():
-                    return cached_candles or []
-            rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_D1, 0, count)
+        with _broker_lock:
+            if not _broker_connected and not ensure_broker():
+                return cached_candles or []
+            broker = get_broker()
+            tf_d1 = broker.TIMEFRAME_D1
+            rates = broker.copy_rates_from_pos(SYMBOL, tf_d1, 0, count)
         if rates is None or len(rates) == 0:
             return cached_candles or []
 
@@ -405,7 +417,7 @@ HTML_TEMPLATE = """
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@300;400;500;600;700;800&display=swap');
-:root{--bg0:#06080d;--bg1:#0c1017;--bg2:#131922;--bg3:#1a2235;--bg4:#222d42;--bdr:#1e2d4a;--txt:#e8edf5;--txt2:#8899b4;--txt3:#4e6082;--grn:#00e676;--red:#ff1744;--yel:#ffc400;--blu:#448aff;--pur:#b388ff;--grnD:rgba(0,230,118,0.12);--redD:rgba(255,23,68,0.12);--bluD:rgba(68,138,255,0.12)}
+:root{--bg0:#0a0e17;--bg1:#0f1923;--bg2:#141e30;--bg3:#1a2744;--txt:#e0e6ed;--txt2:#8892a4;--txt3:#4a5568;--blu:#448aff;--grn:#00e676;--red:#ff1744;--yel:#ffc400;--pur:#7c4dff;--bdr:#1e3050}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Inter',system-ui,sans-serif;background:var(--bg0);color:var(--txt);overflow-x:hidden}
 .mono{font-family:'JetBrains Mono',monospace}
@@ -434,8 +446,8 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--bg0);color:var(--
 .chart-hdr .ohlc{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--txt2);display:flex;gap:8px}
 .chart-hdr .ohlc span{display:inline-flex;align-items:center;gap:2px}
 .ohlc .lbl{color:var(--txt3);font-size:9px}
-#priceChart{flex:1;min-height:350px}
-#probChart{height:120px;border-top:1px solid var(--bdr)}
+
+
 
 .side{display:flex;flex-direction:column;gap:8px}
 
@@ -488,15 +500,17 @@ tr:hover td{background:var(--bg3)}
 .g{color:var(--grn)!important}.r{color:var(--red)!important}.y{color:var(--yel)!important}.b{color:var(--blu)!important}
 .empty{text-align:center;padding:16px;color:var(--txt3);font-size:12px}
 
-.bottom{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}
+.bottom{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px;align-items:start}
 .perf-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-.p-item{background:var(--bg1);border-radius:10px;border:1px solid var(--bdr);padding:8px 10px}
+.perf-box{background:var(--bg1);border-radius:14px;border:1px solid var(--bdr);padding:12px}
+.perf-box .sec-hdr{padding:0 4px 8px;margin-bottom:0;border:none}
+.p-item{background:var(--bg3);border-radius:10px;border:1px solid var(--bdr);padding:8px 10px}
 .p-item .p-lbl{font-size:8px;text-transform:uppercase;letter-spacing:1px;color:var(--txt3);margin-bottom:1px}
 .p-item .p-val{font-size:18px;font-weight:800;font-family:'JetBrains Mono',monospace}
 
 .chart-wrap{background:var(--bg1);border-radius:14px;border:1px solid var(--bdr);overflow:hidden;margin-bottom:8px}
 .chart-wrap .sec-hdr{padding:8px 14px;border-bottom:1px solid var(--bdr)}
-#equityChart{width:100%;height:140px}
+
 
 .foot{text-align:center;padding:6px;color:var(--txt3);font-size:10px}
 @media(max-width:1200px){.layout{grid-template-columns:1fr}}
@@ -574,7 +588,7 @@ tr:hover td{background:var(--bg3)}
   </div>
 
   <div class="bottom">
-    <div>
+    <div class="perf-box">
       <div class="sec-hdr" style="padding:0 4px;margin-bottom:6px">Performance</div>
       <div class="perf-grid">
         <div class="p-item"><div class="p-lbl">Trades</div><div class="p-val" id="p-tr">0</div></div>
@@ -682,20 +696,20 @@ function renderMarkers(markers){
 }
 
 function updateUI(data){
-    const mt5=data.mt5,sig=data.signal,perf=data.performance||{};hist=data.history||[];
+    const brk=data.broker,sig=data.signal,perf=data.performance||{};hist=data.history||[];
 
-    const conn=mt5&&mt5.connected;
+    const conn=brk&&brk.connected;
     document.getElementById('conn-dot').className='dot '+(conn?'dot-on':'dot-off');
-    document.getElementById('conn-txt').textContent=conn?'MT5 Live':'Offline';
-    document.getElementById('server-name').textContent=conn?mt5.server:'--';
+    document.getElementById('conn-txt').textContent=conn?'cTrader Live':'Offline';
+    document.getElementById('server-name').textContent=conn?brk.server:'--';
 
     const lp=document.getElementById('live-price');
     const pc=document.getElementById('price-chg');
-    if(conn&&mt5.bid){
-        lp.textContent=mt5.bid.toFixed(5);
+    if(conn&&brk.bid){
+        lp.textContent=brk.bid.toFixed(5);
         if(data.candles&&data.candles.length>1){
             const prev=data.candles[data.candles.length-2].close;
-            const d=mt5.bid-prev;
+            const d=brk.bid-prev;
             const pct=d/prev*100;
             pc.textContent=(d>=0?'+':'')+( d*10000).toFixed(1)+'p '+(pct>=0?'+':'')+pct.toFixed(3)+'%';
             pc.className='price-chg mono '+(d>=0?'up':'dn');
@@ -704,10 +718,10 @@ function updateUI(data){
     }else{lp.textContent='--';pc.textContent='';}
 
     if(conn){
-        document.getElementById('bal').textContent='$'+mt5.balance.toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:2});
-        document.getElementById('eq').textContent='$'+mt5.equity.toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:2});
-        document.getElementById('fm').textContent='$'+mt5.free_margin.toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:2});
-        document.getElementById('sp').textContent=mt5.spread.toFixed(1);
+        document.getElementById('bal').textContent='$'+brk.balance.toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:2});
+        document.getElementById('eq').textContent='$'+brk.equity.toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:2});
+        document.getElementById('fm').textContent='$'+brk.free_margin.toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:2});
+        document.getElementById('sp').textContent=brk.spread.toFixed(1);
     }
 
     if(sig){
@@ -753,10 +767,10 @@ function updateUI(data){
 
     const posB=document.getElementById('pos-body');
     const noP=document.getElementById('no-pos');
-    if(mt5&&mt5.positions&&mt5.positions.length>0){
+    if(brk&&brk.positions&&brk.positions.length>0){
         noP.style.display='none';
-        document.getElementById('pos-cnt').textContent=mt5.positions.length;
-        posB.innerHTML=mt5.positions.map(p=>{
+        document.getElementById('pos-cnt').textContent=brk.positions.length;
+        posB.innerHTML=brk.positions.map(p=>{
             const pc=p.profit>=0?'g':'r';
             return '<tr><td>'+p.time.substring(11,19)+'</td><td class="'+(p.type==='BUY'?'g':'r')+'" style="font-weight:700">'+p.type+'</td><td>'+p.volume.toFixed(2)+'</td><td>'+p.price_open.toFixed(5)+'</td><td>'+p.price_current.toFixed(5)+'</td><td>'+p.sl.toFixed(5)+'</td><td>'+p.tp.toFixed(5)+'</td><td class="'+pc+'" style="font-weight:700">$'+p.profit.toFixed(2)+'</td></tr>';
         }).join('');
@@ -804,6 +818,7 @@ function updateEquity(data){
 async function fetchStatus(){
     try{
         const r=await fetch('/api/status');
+        if(!r.ok) throw new Error('HTTP '+r.status);
         const data=await r.json();
         if(data.candles&&data.candles.length>0){
             if(!candleSeries)initCharts();
@@ -814,7 +829,8 @@ async function fetchStatus(){
         updateUI(data);
     }catch(e){
         document.getElementById('conn-dot').className='dot dot-off';
-        document.getElementById('conn-txt').textContent='Error '+e.message;
+        document.getElementById('conn-txt').textContent='Reconnecting...';
+        console.error('fetchStatus error:',e);
     }
 }
 
@@ -840,7 +856,7 @@ def dashboard():
 
 @app.route("/api/status")
 def api_status():
-    mt5_info = get_mt5_info()
+    broker_info = get_account_info()
     sig = _cached_signal if _cached_signal else {"signal": "PENDING", "timestamp": datetime.datetime.utcnow().isoformat()}
     if not _cached_signal:
         threading.Thread(target=_bg_compute_signal, daemon=True).start()
@@ -854,8 +870,8 @@ def api_status():
     pnl_list = [t.get("pnl", 0) for t in trade_history if t.get("pnl") is not None]
 
     equity_history = []
-    balance = mt5_info.get("balance", 10000) if mt5_info and mt5_info.get("connected") else 10000
-    equity = mt5_info.get("equity", balance) if mt5_info and mt5_info.get("connected") else balance
+    balance = broker_info.get("balance", 10000) if broker_info and broker_info.get("connected") else 10000
+    equity = broker_info.get("equity", balance) if broker_info and broker_info.get("connected") else balance
     equity_history.append({"time": datetime.datetime.utcnow().isoformat(), "equity": equity})
     for t in trade_history[-100:]:
         equity_history.append({
@@ -879,7 +895,7 @@ def api_status():
     analysis = get_chart_analysis(200)
 
     return jsonify({
-        "mt5": mt5_info or {},
+        "broker": broker_info or {},
         "signal": sig,
         "history": trade_history[-50:],
         "performance": perf,
@@ -907,22 +923,22 @@ def api_refresh():
 
 @app.route("/api/trade", methods=["POST"])
 def api_trade():
-    from trader_d1 import connect_mt5, run_trading_cycle, disconnect_mt5
-    if connect_mt5():
+    from trader_d1 import init_broker, run_trading_cycle, shutdown_broker
+    if init_broker():
         try:
             result = run_trading_cycle()
             return jsonify({"success": True, "result": str(result)})
         except Exception as e:
             return jsonify({"success": False, "error": str(e)})
         finally:
-            disconnect_mt5()
-    return jsonify({"success": False, "error": "MT5 not connected"})
+            shutdown_broker()
+    return jsonify({"success": False, "error": "Broker not connected"})
 
 
 @app.route("/api/close", methods=["POST"])
 def api_close():
-    from trader_d1 import connect_mt5, get_open_position, close_position, disconnect_mt5
-    if connect_mt5():
+    from trader_d1 import init_broker, get_open_position, close_position, shutdown_broker
+    if init_broker():
         try:
             pos = get_open_position()
             if pos:
@@ -930,8 +946,8 @@ def api_close():
                 return jsonify({"success": True})
             return jsonify({"success": False, "error": "No position"})
         finally:
-            disconnect_mt5()
-    return jsonify({"success": False, "error": "MT5 not connected"})
+            shutdown_broker()
+    return jsonify({"success": False, "error": "Broker not connected"})
 
 
 @app.route("/api/signal")
@@ -941,24 +957,28 @@ def api_signal():
 
 
 def run_bot_with_dashboard(host="0.0.0.0", port=5000):
-    from trader_d1 import connect_mt5, build_signal, get_open_position, close_position, place_order, SYMBOL, MAGIC_NUMBER, BREAKEVEN_PIPS, TRAIL_PIPS
+    from trader_d1 import init_broker, build_signal, get_open_position, close_position, place_order, SYMBOL, BREAKEVEN_PIPS, TRAIL_PIPS
 
     print(f"\n{'='*60}")
-    print(f"  D1 Trading Bot + Dashboard")
-    print(f"  Dashboard: http://localhost:{port}")
-    print(f"  Strategy: XGBoost + Vol Filter + Trailing Stop")
-    print(f"  BE={BREAKEVEN_PIPS}p / Trail={TRAIL_PIPS}p")
+    print(" /$$$$$$$$                                       /$$$$$$  /$$$$$$")
+    print("| $$_____/                                      /$$__  $$|_  $$_/")
+    print("| $$     /$$$$$$   /$$$$$$   /$$$$$$  /$$   /$$| $$  \\ $$  | $$  ")
+    print("| $$$$$ /$$__  $$ /$$__  $$ /$$__  $$|  $$ /$$/| $$$$$$$$  | $$  ")
+    print("| $$__/| $$  \\ $$| $$  \\__/| $$$$$$$$ \\  $$$$/ | $$__  $$  | $$  ")
+    print("| $$   | $$  | $$| $$      | $$_____/  >$$  $$ | $$  | $$  | $$  ")
+    print("| $$   |  $$$$$$/| $$      |  $$$$$$$ /$$/\\  $$| $$  | $$ /$$$$$$")
+    print("|__/    \\______/ |__/       \\_______/|__/  \\__/|__/  |__/|______/")
+    print(f"  Dashboard: http://localhost:{port} | powered by moonway")
     print(f"{'='*60}")
 
-    if not connect_mt5():
-        print("Cannot connect to MT5! Starting dashboard anyway...")
+    if not init_broker():
+        print("Cannot connect to broker! Starting dashboard anyway...")
 
     bot_status["running"] = True
     last_trade_date = None
 
     def bot_loop():
         nonlocal last_trade_date
-        import MetaTrader5 as mt5_inner
         while True:
             try:
                 now = datetime.datetime.utcnow()
@@ -974,11 +994,17 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
                         bot_status["errors"] = bot_status.get("errors", [])[-5:]
 
                         if signal != "HOLD":
-                            from trader_d1 import connect_mt5 as cm, run_trading_cycle, disconnect_mt5 as dm
-                            if cm():
+                            from trader_d1 import init_broker as tb_init2, run_trading_cycle, shutdown_broker as tb_shut2
+                            if tb_init2():
                                 try:
                                     result = run_trading_cycle()
                                     if result:
+                                        try:
+                                            broker = get_broker()
+                                            info = broker.account_info()
+                                            equity_before = info.equity if info else 0
+                                        except Exception:
+                                            equity_before = 0
                                         trade_data = {
                                             "timestamp": now.isoformat(),
                                             "signal": signal,
@@ -986,11 +1012,11 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
                                             "prob_up": sig.get("prob_up", 0),
                                             "vol_pred": sig.get("vol_pred", 0),
                                             "adx": sig.get("adx", 0),
-                                            "equity_before": mt5_inner.account_info().equity if mt5_inner.account_info() else 0,
+                                            "equity_before": equity_before,
                                         }
                                         save_trade(trade_data)
                                 finally:
-                                    dm()
+                                    tb_shut2()
                         last_trade_date = today
                     except Exception as e:
                         bot_status["errors"] = bot_status.get("errors", []) + [str(e)]
@@ -1017,7 +1043,18 @@ if __name__ == "__main__":
 
     cmd = sys.argv[1].lower()
     if cmd == "dashboard":
-        ensure_mt5()
+        print("=" * 60)
+        print(" /$$$$$$$$                                       /$$$$$$  /$$$$$$")
+        print("| $$_____/                                      /$$__  $$|_  $$_/")
+        print("| $$     /$$$$$$   /$$$$$$   /$$$$$$  /$$   /$$| $$  \\ $$  | $$  ")
+        print("| $$$$$ /$$__  $$ /$$__  $$ /$$__  $$|  $$ /$$/| $$$$$$$$  | $$  ")
+        print("| $$__/| $$  \\ $$| $$  \\__/| $$$$$$$$ \\  $$$$/ | $$__  $$  | $$  ")
+        print("| $$   | $$  | $$| $$      | $$_____/  >$$  $$ | $$  | $$  | $$  ")
+        print("| $$   |  $$$$$$/| $$      |  $$$$$$$ /$$/\\  $$| $$  | $$ /$$$$$$")
+        print("|__/    \\______/ |__/       \\_______/|__/  \\__/|__/  |__/|______/")
+        print("powered by moonway")
+        print("=" * 60)
+        threading.Thread(target=ensure_broker, daemon=True).start()
         load_logs()
         bot_status["running"] = False
         app.run(host="0.0.0.0", port=5000, debug=False)

@@ -83,7 +83,7 @@ TRAIN_CONFIG = {
 }
 
 RISK_CONFIG = {
-    "risk_per_trade": 0.01,
+    "risk_per_trade": 0.02,
     "max_leverage": 50.0,
     "initial_equity": 10000.0,
     "pip_value_per_lot": 10.0,
@@ -105,8 +105,13 @@ BACKTEST_CONFIG = {
 MODEL_SAVE_PATH = "models/forex_predictor.pth"
 SCALER_SAVE_PATH = "models/scaler.pkl"
 
-MT5_CONFIG = {
-    "path": r"C:\Program Files\MetaTrader 5\terminal64.exe",
+CTRADER_CONFIG = {
+    "host": "demo.ctraderapi.com",
+    "port": 5035,                           
+    "client_id": "25719_p6KKm1idyxlgQmGIna3j0Vx3E3yaSkmUd2IE5HfVjogt59hkDY",
+    "client_secret": "VGcTNNc0SlPQ3bAVktCWQnsQcVW5RNlEVit14EsjZtolEx4RTz",
+    "access_token": "Wf0y4aaLLsbvaMRvlQnyp_uWixAIC2lQEG4iIIwICKI",
+    "refresh_token": "UczvFq7BsK99J9PNxghS-18kGTyBeV1B1dkEXBplrAc",
+    "account_id": 46995819,                  
     "symbol": "EURUSD",
-    "magic_number": 123456,
 }

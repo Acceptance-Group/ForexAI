@@ -8,28 +8,44 @@ import yfinance as yf
 
 from config import (
     YFINANCE_TICKERS, FRED_SERIES, DATA_CONFIG,
-    FEATURE_COLUMNS, MT5_CONFIG,
+    FEATURE_COLUMNS, CTRADER_CONFIG,
 )
 
-MT5_BARS_LIMIT = 20000
+BARS_LIMIT = 20000
+
+_broker_instance = None
+
+
+def _get_broker():
+    global _broker_instance
+    if _broker_instance is not None:
+        from broker import get_broker
+        b = get_broker()
+        if b and b.is_connected:
+            return b
+    from broker import init_broker, get_broker
+    if not init_broker():
+        raise RuntimeError("Cannot connect to broker")
+    _broker_instance = True
+    return get_broker()
+
+
+def _get_broker_symbol(symbol=None):
+    if symbol is None:
+        symbol = CTRADER_CONFIG.get("symbol", "EURUSD")
+    clean = symbol.replace("/", "").replace(" ", "").upper()
+    symbol_map = {
+        "EURUSD": "EURUSD",
+        "GBPUSD": "GBPUSD",
+        "USDJPY": "USDJPY",
+    }
+    return symbol_map.get(clean, clean)
 
 
 def fetch_d1_data(symbol=None) -> pd.DataFrame:
     try:
-        import MetaTrader5 as mt5
-        if symbol is None:
-            symbol = MT5_CONFIG["symbol"]
-        mt5_path = MT5_CONFIG.get("path", r"C:\Program Files\MetaTrader 5\terminal64.exe")
-        if not mt5.initialize(path=mt5_path):
-            print(f"MT5 init failed: {mt5.last_error()}")
-            return None
-
-        if not mt5.symbol_info(symbol):
-            for s in mt5.symbols_get():
-                if s.name == symbol:
-                    break
-
-        mt5.symbol_select(symbol, True)
+        broker = _get_broker()
+        sym = _get_broker_symbol(symbol)
 
         start_date = DATA_CONFIG["start_date"]
         if isinstance(start_date, str):
@@ -43,9 +59,10 @@ def fetch_d1_data(symbol=None) -> pd.DataFrame:
         all_dfs = []
         offset = 0
         chunk_count = 0
+        tf_d1 = broker.TIMEFRAME_D1
 
         while True:
-            rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_D1, offset, MT5_BARS_LIMIT)
+            rates = broker.copy_rates_from_pos(sym, tf_d1, offset, BARS_LIMIT)
             if rates is None or len(rates) == 0:
                 break
 
@@ -59,7 +76,7 @@ def fetch_d1_data(symbol=None) -> pd.DataFrame:
                 df_chunk.index = df_chunk.index.tz_localize(None)
 
             chunk_start = df_chunk.index[0]
-            print(f"  D1 {symbol} chunk {chunk_count+1}: {chunk_start.strftime('%Y-%m-%d')} ({len(df_chunk)} bars)")
+            print(f"  D1 {sym} chunk {chunk_count+1}: {chunk_start.strftime('%Y-%m-%d')} ({len(df_chunk)} bars)")
 
             if chunk_start < start_date:
                 df_chunk = df_chunk[df_chunk.index >= start_date]
@@ -70,14 +87,12 @@ def fetch_d1_data(symbol=None) -> pd.DataFrame:
             if chunk_start < start_date:
                 break
 
-            offset += MT5_BARS_LIMIT - 500
+            offset += BARS_LIMIT - 500
             if chunk_count >= 20:
                 break
 
-        mt5.shutdown()
-
         if not all_dfs:
-            print(f"No D1 data from MT5 for {symbol}")
+            print(f"No D1 data from broker for {sym}")
             return None
 
         df = pd.concat(all_dfs)
@@ -85,17 +100,10 @@ def fetch_d1_data(symbol=None) -> pd.DataFrame:
         df = df.sort_index()
         df = df[(df.index >= start_date) & (df.index <= end_date)]
 
-        print(f"Loaded {len(df)} D1 bars for {symbol}: {df.index[0]} to {df.index[-1]}")
+        print(f"Loaded {len(df)} D1 bars for {sym}: {df.index[0]} to {df.index[-1]}")
         return df
-    except ImportError:
-        print("MetaTrader5 not available")
-        return None
     except Exception as e:
-        print(f"MT5 D1 error for {symbol}: {e}")
-        try:
-            mt5.shutdown()
-        except:
-            pass
+        print(f"Broker D1 error for {symbol}: {e}")
         return None
 
 
@@ -103,7 +111,7 @@ def fetch_cross_symbols() -> dict:
     symbols = {"GBPUSD": "GBPUSD", "USDJPY": "USDJPY"}
     results = {}
     for name, sym in symbols.items():
-        print(f"Fetching {name} D1 data from MT5...")
+        print(f"Fetching {name} D1 data from broker...")
         for alias in [sym, sym.replace("USD", "USD.")]:
             df = fetch_d1_data(alias)
             if df is not None and len(df) > 100:
@@ -166,80 +174,76 @@ def compute_atr(high, low, close, period=14):
 
 
 def compute_adx(high, low, close, period=14):
-    prev_close = close.shift(1)
-    plus_dm = (high - high.shift(1)).clip(lower=0)
-    minus_dm = (low.shift(1) - low).clip(lower=0)
-    mask_plus = (high - prev_close) < (prev_close - low)
-    mask_minus = (prev_close - low) < (high - prev_close)
-    plus_dm[~mask_plus] = 0
-    minus_dm[~mask_minus] = 0
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr_val = tr.rolling(period, min_periods=1).mean()
+    plus_dm = high.diff()
+    minus_dm = low.diff().abs()
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+    atr_val = compute_atr(high, low, close, period)
     plus_di = 100 * (plus_dm.rolling(period, min_periods=1).mean() / (atr_val + 1e-10))
     minus_di = 100 * (minus_dm.rolling(period, min_periods=1).mean() / (atr_val + 1e-10))
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10)
-    adx = dx.rolling(period, min_periods=1).mean()
-    return adx / 100.0
+    return dx.rolling(period, min_periods=1).mean()
 
 
-def compute_macd(prices, fast=12, slow=26, signal=9):
-    ema_fast = prices.ewm(span=fast, adjust=False).mean()
-    ema_slow = prices.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    histogram = macd_line - signal_line
-    return macd_line, signal_line, histogram
-
-
-def compute_rsi(prices, period=14):
-    delta = prices.diff()
-    gain = delta.clip(lower=0)
-    loss = (-delta.clip(upper=0))
-    avg_gain = gain.ewm(com=period - 1, adjust=False).mean()
-    avg_loss = loss.ewm(com=period - 1, adjust=False).mean()
+def compute_rsi(close, period=14):
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.rolling(period, min_periods=period).mean()
+    avg_loss = loss.rolling(period, min_periods=period).mean()
+    for i in range(period, len(gain)):
+        avg_gain.iloc[i] = (avg_gain.iloc[i - 1] * (period - 1) + gain.iloc[i]) / period
+        avg_loss.iloc[i] = (avg_loss.iloc[i - 1] * (period - 1) + loss.iloc[i]) / period
     rs = avg_gain / (avg_loss + 1e-10)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi / 100.0
+    return 100 - (100 / (1 + rs))
 
 
-def compute_candlestick_features(df):
-    body = (df["close"] - df["open"]).abs()
-    full_range = df["high"] - df["low"]
-    full_range_safe = full_range.replace(0, np.nan).fillna(1e-10)
-    body_ratio = body / full_range_safe
-    upper_shadow = df["high"] - df[["open", "close"]].max(axis=1)
-    lower_shadow = df[["open", "close"]].min(axis=1) - df["low"]
-    upper_shadow_pct = upper_shadow / full_range_safe
-    lower_shadow_pct = lower_shadow / full_range_safe
-    is_hammer = ((lower_shadow >= 2.0 * body) & (upper_shadow <= body * 0.3) & (body > 0)).astype(float)
-    is_doji = (body / full_range_safe < 0.1).astype(float)
-    return body_ratio, upper_shadow_pct, lower_shadow_pct, is_hammer, is_doji
+def compute_macd_hist(close, fast=12, slow=26, signal=9):
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    macd_signal = macd.ewm(span=signal, adjust=False).mean()
+    return macd - macd_signal
 
 
-def compute_vwap_ratio(df):
-    typical_price = (df["high"] + df["low"] + df["close"]) / 3
-    vol = df["tick_volume"].astype(float)
-    vol = vol.replace(0, vol.median()).ffill().bfill()
-    tp_vol = typical_price * vol
-    vwap = tp_vol.rolling(20, min_periods=1).sum() / (vol.rolling(20, min_periods=1).sum() + 1e-10)
-    return (df["close"] / vwap - 1.0).fillna(0.0)
+def build_economic_calendar(start_date, end_date=None):
+    calendars = {
+        "nfp": ["2024-01-05", "2024-02-02", "2024-03-08", "2024-04-05", "2024-05-03",
+                "2024-06-07", "2024-07-05", "2024-08-02", "2024-09-06", "2024-10-04",
+                "2024-11-01", "2024-12-06", "2025-01-10", "2025-02-07", "2025-03-07",
+                "2025-04-04", "2025-05-02", "2025-06-06", "2025-07-04", "2025-08-01",
+                "2025-09-05", "2025-10-03", "2025-11-07", "2025-12-05",
+                "2026-01-09", "2026-02-06", "2026-03-06", "2026-04-03"],
+        "fomc": ["2024-01-31", "2024-03-20", "2024-05-01", "2024-06-12", "2024-07-31",
+                 "2024-09-18", "2024-11-07", "2024-12-18", "2025-01-29", "2025-03-19",
+                 "2025-05-07", "2025-06-18", "2025-07-30", "2025-09-17", "2025-11-05",
+                 "2025-12-17", "2026-01-28", "2026-03-18"],
+    }
+    start = pd.Timestamp(start_date)
+    end_d = pd.Timestamp(end_date) if end_date else pd.Timestamp.now()
+    all_dates = pd.DatetimeIndex([])
+    for name, dates in calendars.items():
+        for d in dates:
+            dt = pd.Timestamp(d)
+            for offset_days in [-1, 0, 1]:
+                event_day = dt + pd.Timedelta(days=offset_days)
+                if start <= event_day <= end_d:
+                    all_dates = all_dates.append(pd.DatetimeIndex([event_day]))
+    return all_dates.unique().sort_values() if len(all_dates) > 0 else pd.DatetimeIndex([])
 
 
 def fetch_intraday_features(symbol=None) -> dict:
-    """Fetch H4 and H1 last-bar features for each D1 date from MT5."""
     results = {}
-    for tf_name, tf_const_val in [("H4", 16388), ("H1", 16385)]:
+
+    broker = _get_broker()
+    tf_map = {"H4": broker.TIMEFRAME_H4, "H1": broker.TIMEFRAME_H1}
+
+    for tf_name, tf_const in tf_map.items():
         try:
-            import MetaTrader5 as mt5
-            mt5_path = MT5_CONFIG.get("path", r"C:\Program Files\MetaTrader 5\terminal64.exe")
-            if not mt5.initialize(path=mt5_path):
-                continue
             if symbol is None:
-                symbol = MT5_CONFIG["symbol"]
-            mt5.symbol_select(symbol, True)
+                sym = CTRADER_CONFIG.get("symbol", "EURUSD")
+            else:
+                sym = _get_broker_symbol(symbol)
 
             start_date = DATA_CONFIG["start_date"]
             if isinstance(start_date, str):
@@ -249,8 +253,7 @@ def fetch_intraday_features(symbol=None) -> dict:
                 end_date = pd.Timestamp(end_date) + pd.Timedelta(days=1)
 
             bars_limit = 50000
-            rates = mt5.copy_rates_from_pos(symbol, tf_const_val, 0, bars_limit)
-            mt5.shutdown()
+            rates = broker.copy_rates_from_pos(sym, tf_const, 0, bars_limit)
 
             if rates is None or len(rates) == 0:
                 print(f"  No {tf_name} intraday data")
@@ -269,303 +272,136 @@ def fetch_intraday_features(symbol=None) -> dict:
             results[tf_name] = df
         except Exception as e:
             print(f"  {tf_name} intraday error: {e}")
+
     return results
 
 
-def build_economic_calendar(start="2010-01-01") -> pd.DataFrame:
-    """Build economic event calendar with date flags for major releases."""
-    try:
-        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id=PAYEMS"
-        resp = requests.get(url, timeout=15)
-        if resp.status_code == 200:
-            df = pd.read_csv(io.StringIO(resp.text))
-            df["date"] = pd.to_datetime(df["date"])
-            df = df.set_index("date")
-            nfp_dates = set(df.index.normalize())
-        else:
-            nfp_dates = set()
-    except:
-        nfp_dates = set()
+def engineer_d1_features(d1, macro, cross_data, intraday_data, calendar):
+    df = d1.copy()
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
+    vol = df["tick_volume"].astype(float)
 
-    date_range = pd.date_range(start=start, end="2026-12-31", freq="D")
-    cal = pd.DataFrame(index=date_range)
-    cal["is_nfp_day"] = 0.0
-    cal["is_fomc_day"] = 0.0
-    cal["is_cpi_day"] = 0.0
-    cal["news_impact"] = 0.0
+    df["d1_log_return"] = np.log(close / close.shift(1))
+    df["d1_ret_3"] = df["d1_log_return"].rolling(3).sum()
+    df["d1_ret_5"] = df["d1_log_return"].rolling(5).sum()
+    df["d1_ret_10"] = df["d1_log_return"].rolling(10).sum()
+    df["d1_ret_20"] = df["d1_log_return"].rolling(20).sum()
 
-    for d in nfp_dates:
-        if d in cal.index:
-            cal.loc[d, "is_nfp_day"] = 1.0
-            cal.loc[d, "news_impact"] = 1.0
-
-    fomc_dates_approx = [
-        "2010-01-27","2010-03-16","2010-04-28","2010-06-23","2010-08-10","2010-09-21","2010-11-03","2010-12-14",
-        "2011-01-26","2011-03-15","2011-04-27","2011-06-22","2011-08-09","2011-09-21","2011-11-02","2011-12-13",
-        "2012-01-25","2012-03-13","2012-04-25","2012-06-20","2012-08-01","2012-09-13","2012-10-24","2012-12-12",
-        "2013-01-30","2013-03-20","2013-05-01","2013-06-19","2013-07-31","2013-09-18","2013-10-30","2013-12-18",
-        "2014-01-29","2014-03-19","2014-04-30","2014-06-18","2014-07-30","2014-09-17","2014-10-29","2014-12-17",
-        "2015-01-28","2015-03-18","2015-04-29","2015-06-17","2015-07-29","2015-09-17","2015-10-28","2015-12-16",
-        "2016-01-27","2016-03-16","2016-04-27","2016-06-15","2016-07-27","2016-09-21","2016-11-02","2016-12-14",
-        "2017-02-01","2017-03-15","2017-05-03","2017-06-14","2017-07-26","2017-09-20","2017-11-01","2017-12-13",
-        "2018-01-31","2018-03-21","2018-05-02","2018-06-13","2018-08-01","2018-09-26","2018-11-08","2018-12-19",
-        "2019-01-30","2019-03-20","2019-05-01","2019-06-19","2019-07-31","2019-09-18","2019-10-30","2019-12-11",
-        "2020-01-29","2020-03-15","2020-04-29","2020-06-10","2020-07-29","2020-09-16","2020-11-05","2020-12-16",
-        "2021-01-27","2021-03-17","2021-04-28","2021-06-16","2021-07-28","2021-09-22","2021-11-03","2021-12-15",
-        "2022-01-26","2022-03-16","2022-05-04","2022-06-15","2022-07-27","2022-09-21","2022-11-02","2022-12-14",
-        "2023-02-01","2023-03-22","2023-05-03","2023-06-14","2023-07-26","2023-09-20","2023-11-01","2023-12-13",
-        "2024-01-31","2024-03-20","2024-05-01","2024-06-12","2024-07-31","2024-09-18","2024-11-07","2024-12-18",
-        "2025-01-29","2025-03-19","2025-05-07","2025-06-18","2025-07-30","2025-09-17","2025-11-05","2025-12-17",
-    ]
-    for d_str in fomc_dates_approx:
-        d = pd.Timestamp(d_str)
-        if d in cal.index:
-            cal.loc[d, "is_fomc_day"] = 1.0
-            cal.loc[d, "news_impact"] = np.maximum(cal.loc[d, "news_impact"], 1.0)
-
-    cpi_dates_approx = [
-        "2010-01-15","2010-02-19","2010-03-17","2010-04-15","2010-05-14","2010-06-17","2010-07-16","2010-08-13","2010-09-15","2010-10-15","2010-11-17","2010-12-15",
-        "2011-01-14","2011-02-18","2011-03-17","2011-04-15","2011-05-13","2011-06-15","2011-07-15","2011-08-16","2011-09-15","2011-10-14","2011-11-16","2011-12-16",
-    ]
-    for y in range(2012, 2027):
-        for m in range(1, 13):
-            cpi_dates_approx.append(f"{y}-{m:02d}-13")
-    for d_str in cpi_dates_approx:
-        d = pd.Timestamp(d_str)
-        if d in cal.index:
-            cal.loc[d, "is_cpi_day"] = 1.0
-
-    return cal
-
-
-def engineer_d1_features(d1: pd.DataFrame, macro: pd.DataFrame,
-                         cross_data: dict = None,
-                         intraday_data: dict = None,
-                         calendar: pd.DataFrame = None) -> pd.DataFrame:
-    feats = pd.DataFrame(index=d1.index)
-    close = d1["close"]
-    high = d1["high"]
-    low = d1["low"]
-
-    feats["d1_log_return"] = np.log(close / close.shift(1))
-    feats["d1_ret_3"] = close.pct_change(3)
-    feats["d1_ret_5"] = close.pct_change(5)
-    feats["d1_ret_10"] = close.pct_change(10)
-    feats["d1_ret_20"] = close.pct_change(20)
-
-    atr_raw = compute_atr(high, low, close, DATA_CONFIG["atr_period"])
-    atr_ma = atr_raw.rolling(60, min_periods=1).mean()
-    feats["atr_norm"] = (atr_raw / (atr_ma + 1e-10)).shift(1)
-
-    feats["adx"] = compute_adx(high, low, close).shift(1)
-
-    _, _, macd_hist = compute_macd(close)
-    macd_hist_scale = macd_hist.rolling(60, min_periods=1).std() + 1e-10
-    feats["macd_hist"] = (macd_hist / macd_hist_scale).shift(1)
-
-    feats["rsi"] = compute_rsi(close, 14).shift(1)
-
-    (feats["body_ratio"], _, feats["lower_shadow_pct"],
-     feats["hammer"], feats["doji"]) = compute_candlestick_features(d1)
-
-    vol = d1["tick_volume"].astype(float)
-    vol = vol.replace(0, vol.median()).ffill().bfill()
-    vol_ma = vol.rolling(20, min_periods=1).mean()
-    feats["vol_sma_ratio"] = (vol / (vol_ma + 1e-10)).fillna(1.0)
-
-    sma20 = close.rolling(20, min_periods=1).mean()
-    sma50 = close.rolling(50, min_periods=1).mean()
-    feats["trend_ma20"] = (close / sma20 - 1.0).shift(1)
-    feats["trend_ma50"] = (close / sma50 - 1.0).shift(1)
-
-    feats["vwap_ratio"] = compute_vwap_ratio(d1).shift(1)
-
-    if cross_data is not None:
-        for sym_name, sym_df in cross_data.items():
-            if sym_df is not None and len(sym_df) > 100:
-                sym_close = sym_df["close"]
-                sym_reindexed = sym_close.reindex(d1.index).ffill().bfill()
-                feats[f"{sym_name.lower()}_ret_1"] = sym_reindexed.pct_change(1).shift(1).values[:len(feats)]
-                feats[f"{sym_name.lower()}_ret_5"] = sym_reindexed.pct_change(5).shift(1).values[:len(feats)]
-                eur_ret = close.pct_change(1).values[:len(feats)]
-                sym_ret = sym_reindexed.pct_change(1).values[:len(feats)]
-                rolling_corr = pd.Series(eur_ret).rolling(20, min_periods=5).corr(pd.Series(sym_ret))
-                feats[f"{sym_name.lower()}_corr_20"] = rolling_corr.shift(1).values[:len(feats)]
-            else:
-                feats[f"{sym_name.lower()}_ret_1"] = 0.0
-                feats[f"{sym_name.lower()}_ret_5"] = 0.0
-                feats[f"{sym_name.lower()}_corr_20"] = 0.0
+    if "DXY" in macro.columns:
+        dxy = macro["DXY"].reindex(df.index, method="ffill")
+        df["dxy_momentum"] = dxy.pct_change(5).reindex(df.index)
     else:
-        feats["gbpusd_ret_1"] = 0.0
-        feats["gbpusd_ret_5"] = 0.0
-        feats["gbpusd_corr_20"] = 0.0
-        feats["usdjpy_ret_1"] = 0.0
-        feats["usdjpy_ret_5"] = 0.0
-        feats["usdjpy_corr_20"] = 0.0
+        df["dxy_momentum"] = 0.0
 
-    if macro is not None and "DXY" in macro.columns:
-        macro_daily = macro.resample("D").last().ffill()
-        macro_daily = macro_daily.shift(1)
-        dates = d1.index.normalize()
-        macro_aligned = macro_daily.reindex(dates).ffill()
+    atr = compute_atr(high, low, close, DATA_CONFIG["atr_period"])
+    adx = compute_adx(high, low, close, DATA_CONFIG["atr_period"])
+    rsi = compute_rsi(close, 14)
+    df["atr_norm"] = atr / close
+    df["adx"] = adx / 100.0
+    df["rsi"] = rsi / 100.0
+    df["macd_hist"] = compute_macd_hist(close)
 
-        dxy_close = macro_aligned["DXY"]
-        feats["dxy_log_return"] = np.log(dxy_close / dxy_close.shift(1)).values[:len(feats)]
-        dxy_ret_5 = dxy_close.pct_change(5)
-        dxy_ret_20 = dxy_close.pct_change(20)
-        feats["dxy_momentum"] = (dxy_ret_5 - dxy_ret_20).values[:len(feats)]
+    body = close - df["open"] if "open" in df.columns else close - close.shift(1)
+    rng = high - low
+    df["body_ratio"] = (body.abs() / (rng + 1e-10)).fillna(0)
+    lower_shadow = df["open"].clip(upper=close) - low if "open" in df.columns else low * 0
+    df["lower_shadow_pct"] = (lower_shadow / (rng + 1e-10)).fillna(0)
+
+    vol_sma = vol.rolling(20, min_periods=1).mean()
+    df["vol_sma_ratio"] = (vol / (vol_sma + 1e-10)).fillna(1.0)
+
+    ma20 = close.rolling(20, min_periods=1).mean()
+    ma50 = close.rolling(50, min_periods=1).mean()
+    df["trend_ma20"] = (close / ma20 - 1.0).fillna(0)
+    df["trend_ma50"] = (close / ma50 - 1.0).fillna(0)
+
+    typical_price = (high + low + close) / 3
+    vol_recursive = vol.replace(0, vol.median()).ffill().bfill()
+    tp_vol = typical_price * vol_recursive
+    vwap = tp_vol.rolling(20, min_periods=1).sum() / (vol_recursive.rolling(20, min_periods=1).sum() + 1e-10)
+    df["vwap_ratio"] = (close / vwap - 1.0).fillna(0.0)
+
+    for cross_name, cross_df in cross_data.items():
+        prefix = cross_name.lower()
+        cross_close = cross_df["close"].reindex(df.index, method="ffill")
+        df[f"{prefix}_ret_1"] = cross_close.pct_change(1)
+        df[f"{prefix}_ret_5"] = cross_close.pct_change(5)
+        rolling_corr = close.rolling(20, min_periods=10).corr(cross_close)
+        df[f"{prefix}_corr_20"] = rolling_corr.fillna(0)
+
+    if "H4" in intraday_data:
+        h4 = intraday_data["H4"]
+        h4_aligned = h4.reindex(df.index, method="ffill")
+        df["h4_ret_last"] = h4_aligned["close"].pct_change(1).fillna(0)
+        h4_ret_3d = h4_aligned["close"].pct_change(3).fillna(0)
+        df["h4_ret_3d"] = h4_ret_3d
+        h4_range = (h4_aligned["high"] - h4_aligned["low"]) / (h4_aligned["close"] + 1e-10)
+        df["h4_range_pct"] = h4_range.fillna(0)
+        h4_body = (h4_aligned["close"] - h4_aligned["open"]).abs() / (h4_aligned["high"] - h4_aligned["low"] + 1e-10)
+        df["h4_body_pct"] = h4_body.fillna(0)
+
+    df = df.shift(1)
+
+    if len(calendar) > 0:
+        calendar_set = set(calendar.normalize())
+        df["is_news_day"] = df.index.normalize().isin(calendar_set).astype(int)
     else:
-        feats["dxy_log_return"] = 0.0
-        feats["dxy_momentum"] = 0.0
+        df["is_news_day"] = 0
 
-    if intraday_data is not None:
-        for tf_name, tf_cols in [("H4", ["h4_ret_last", "h4_ret_3d", "h4_vol_ratio", "h4_range_pct", "h4_body_pct"]),
-                                   ("H1", ["h1_ret_last", "h1_vol_ratio", "h1_range_pct"])]:
-            if tf_name in intraday_data and intraday_data[tf_name] is not None:
-                tf_df = intraday_data[tf_name]
-                tf_dates = tf_df.index.normalize()
-                tf_close = tf_df["close"]
-                tf_vol = tf_df["tick_volume"].astype(float).replace(0, tf_df["tick_volume"].median())
-                tf_high = tf_df["high"]
-                tf_low = tf_df["low"]
-                tf_open = tf_df["open"]
-
-                daily_groups = tf_df.groupby(tf_dates)
-                daily_last_close = daily_groups["close"].last()
-                daily_first_close = daily_groups["close"].first()
-                daily_open_close_3d = daily_groups["close"].last().pct_change(3)
-
-                last_close_reindexed = daily_last_close.shift(1).reindex(d1.index).ffill()
-                first_close_reindexed = daily_first_close.shift(1).reindex(d1.index).ffill()
-                ret_3d_reindexed = daily_open_close_3d.shift(1).reindex(d1.index).ffill()
-
-                if tf_name == "H4":
-                    daily_vol_mean = daily_groups["tick_volume"].mean()
-                    vol_mean_reindexed = daily_vol_mean.shift(1).reindex(d1.index).ffill()
-                    daily_vol_last = daily_groups["tick_volume"].last()
-                    vol_last_reindexed = daily_vol_last.shift(1).reindex(d1.index).ffill()
-                    feats["h4_ret_last"] = ((last_close_reindexed / first_close_reindexed) - 1).values[:len(feats)]
-                    feats["h4_ret_3d"] = ret_3d_reindexed.values[:len(feats)]
-                    vol_ratio = (vol_last_reindexed / (vol_mean_reindexed + 1e-10)).values[:len(feats)]
-                    feats["h4_vol_ratio"] = np.nan_to_num(vol_ratio, nan=1.0)
-
-                    daily_range_pct = daily_groups.apply(lambda x: (x["high"].max() - x["low"].min()) / (x["close"].iloc[0] + 1e-10) if len(x) > 0 else 0)
-                    feats["h4_range_pct"] = daily_range_pct.shift(1).reindex(d1.index).ffill().values[:len(feats)]
-
-                    daily_body_pct = daily_groups.apply(lambda x: abs(x["close"].iloc[-1] - x["open"].iloc[0]) / (x["high"].max() - x["low"].min() + 1e-10) if len(x) > 0 else 0)
-                    feats["h4_body_pct"] = daily_body_pct.shift(1).reindex(d1.index).ffill().values[:len(feats)]
-
-                elif tf_name == "H1":
-                    daily_vol_mean = daily_groups["tick_volume"].mean()
-                    vol_mean_reindexed = daily_vol_mean.shift(1).reindex(d1.index).ffill()
-                    daily_vol_last = daily_groups["tick_volume"].last()
-                    vol_last_reindexed = daily_vol_last.shift(1).reindex(d1.index).ffill()
-                    feats["h1_ret_last"] = ((last_close_reindexed / first_close_reindexed) - 1).values[:len(feats)]
-                    feats["h1_vol_ratio"] = (vol_last_reindexed / (vol_mean_reindexed + 1e-10)).values[:len(feats)]
-
-                    daily_range_pct = daily_groups.apply(lambda x: (x["high"].max() - x["low"].min()) / (x["close"].iloc[0] + 1e-10) if len(x) > 0 else 0)
-                    feats["h1_range_pct"] = daily_range_pct.shift(1).reindex(d1.index).ffill().values[:len(feats)]
-            else:
-                if tf_name == "H4":
-                    for col in ["h4_ret_last", "h4_ret_3d", "h4_vol_ratio", "h4_range_pct", "h4_body_pct"]:
-                        feats[col] = 0.0
-                else:
-                    for col in ["h1_ret_last", "h1_vol_ratio", "h1_range_pct"]:
-                        feats[col] = 0.0
-    else:
-        for col in ["h4_ret_last", "h4_ret_3d", "h4_vol_ratio", "h4_range_pct", "h4_body_pct",
-                     "h1_ret_last", "h1_vol_ratio", "h1_range_pct"]:
-            feats[col] = 0.0
-
-    if calendar is not None:
-        cal_shifted = calendar.shift(1)
-        cal_reindexed = cal_shifted.reindex(d1.index).ffill().fillna(0)
-        for col in ["news_impact", "is_nfp_day", "is_fomc_day", "is_cpi_day"]:
-            if col in cal_reindexed.columns:
-                feats[col] = cal_reindexed[col].values[:len(feats)]
-            else:
-                feats[col] = 0.0
-    else:
-        feats["news_impact"] = 0.0
-        feats["is_nfp_day"] = 0.0
-        feats["is_fomc_day"] = 0.0
-        feats["is_cpi_day"] = 0.0
-
-    feats = feats.replace([np.inf, -np.inf], np.nan)
-    feats = feats.ffill().bfill()
-
-    for col in FEATURE_COLUMNS:
-        if col not in feats.columns:
-            feats[col] = 0.0
-
-    return feats[FEATURE_COLUMNS]
+    return df
 
 
-def apply_triple_barrier_d1(prices: pd.Series, tp: float, sl: float, max_bars: int) -> pd.DataFrame:
-    results = []
-    prices_arr = prices.values
+def verify_no_leakage(features, raw_prices):
+    shifted_cols = [c for c in features.columns if c in [
+        "d1_log_return", "d1_ret_3", "d1_ret_5", "d1_ret_10", "d1_ret_20",
+        "atr_norm", "adx", "rsi", "macd_hist", "vwap_ratio",
+    ]]
+    for col in shifted_cols:
+        if col in features.columns and col in raw_prices.columns:
+            future_vals = raw_prices[col].shift(-1)
+            corr = features[col].corr(future_vals)
+            if abs(corr) > 0.1:
+                print(f"  WARNING: {col} may leak (shifted corr={corr:.4f})")
 
-    for i in range(len(prices_arr) - max_bars):
-        entry_price = prices_arr[i]
+
+def apply_triple_barrier_d1(close, tp=0.010, sl=0.005, max_bars=20):
+    n = len(close)
+    labels = pd.DataFrame(index=close.index, columns=["label", "pips", "pnl"])
+    for i in range(n - 1):
+        entry_price = close.iloc[i + 1]
+        if np.isnan(entry_price) or entry_price <= 0:
+            continue
+        tp_price = entry_price * (1 + tp)
+        sl_price = entry_price * (1 - sl)
         label = 0
-        exit_bar = max_bars
-
-        for j in range(1, max_bars + 1):
-            if i + j >= len(prices_arr):
-                break
-            ret = (prices_arr[i + j] - entry_price) / entry_price
-
-            if ret >= tp:
+        exit_price = entry_price
+        for j in range(1, min(max_bars + 1, n - i - 1)):
+            high_j = close.iloc[i + 1 + j - 1] if (i + 1 + j - 1) < n else close.iloc[i + 1]
+            low_j = close.iloc[i + 1 + j - 1] if (i + 1 + j - 1) < n else close.iloc[i + 1]
+            if j < n - i - 2:
+                h = close.iloc[i + 1:i + 1 + j + 2].max()
+                l = close.iloc[i + 1:i + 1 + j + 2].min()
+            else:
+                h = close.iloc[i + 1 + j] if i + 1 + j < n else close.iloc[i + 1]
+                l = close.iloc[i + 1 + j] if i + 1 + j < n else close.iloc[i + 1]
+            if h >= tp_price:
                 label = 1
-                exit_bar = j
+                exit_price = tp_price
                 break
-            elif ret <= -sl:
+            if l <= sl_price:
                 label = -1
-                exit_bar = j
+                exit_price = sl_price
                 break
         else:
-            ret_final = (prices_arr[i + max_bars] - entry_price) / entry_price
-            label = 1 if ret_final > 0 else -1 if ret_final < 0 else 0
-            exit_bar = max_bars
-
-        results.append({
-            "date": prices.index[i],
-            "label": label,
-            "exit_bar": exit_bar,
-        })
-
-    return pd.DataFrame(results).set_index("date")
-
-
-def verify_no_leakage(feats: pd.DataFrame, prices: pd.DataFrame):
-    issues = []
-    h4_close = prices["close"] if isinstance(prices, pd.DataFrame) else prices
-    next_return = np.log(h4_close / h4_close.shift(-1))
-    for col in feats.columns:
-        corr = feats[col].corr(next_return.reindex(feats.index))
-        if abs(corr) > 0.5:
-            msg = f"LEAKAGE WARNING: {col} corr with next-bar return = {corr:.3f}"
-            issues.append(msg)
-            print(msg)
-    if not issues:
-        print("Leakage check PASSED.")
-    return len(issues) == 0
-
-
-def build_regime_labels(prices: pd.Series, atr: pd.Series, lookback: int = 20) -> pd.DataFrame:
-    next_ret = prices.pct_change().shift(-1)
-    next_abs_ret = next_ret.abs()
-    atr_val = atr
-    rolling_atr_mean = atr_val.rolling(lookback, min_periods=1).mean()
-    threshold = 0.5 * atr_val / prices
-    trending = (next_abs_ret > threshold).astype(int)
-    results = pd.DataFrame({
-        "regime_label": trending,
-        "next_abs_ret": next_abs_ret,
-        "threshold": threshold,
-    }, index=prices.index)
-    results = results.replace([np.inf, -np.inf], np.nan).dropna()
-    return results
+            label = 0
+            exit_price = close.iloc[min(i + 1 + max_bars, n - 1)]
+        pips = (exit_price - entry_price) * 10000
+        labels.iloc[i] = [label, pips, pips]
+    labels = labels.shift(1)
+    labels.columns = ["label", "pips", "pnl"]
+    return labels.dropna()
 
 
 def build_dataset(force_download: bool = False) -> pd.DataFrame:
@@ -580,7 +416,7 @@ def build_dataset(force_download: bool = False) -> pd.DataFrame:
 
     d1 = fetch_d1_data()
     if d1 is None or len(d1) < 500:
-        raise RuntimeError("Cannot get D1 data. Please start MetaTrader 5 and try again.")
+        raise RuntimeError("Cannot get D1 data. Check broker connection and try again.")
 
     cross_data = fetch_cross_symbols()
     macro = fetch_daily_macro()
