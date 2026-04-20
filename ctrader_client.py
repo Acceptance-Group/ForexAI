@@ -82,8 +82,10 @@ class CTraderClient:
         self._events[response_name] = ev
         self._events.setdefault("ProtoOAErrorRes_backup", threading.Event())
         self._events["ProtoOAErrorRes"] = ev
-        deferred = self._client.send(request)
-        deferred.addErrback(lambda f: log.error(f"Send error: {f}"))
+        if reactor.running:
+            reactor.callFromThread(self._client.send, request)
+        else:
+            self._client.send(request)
         ev.wait(timeout=timeout or self._timeout)
         self._events.pop(response_name, None)
         self._events.pop("ProtoOAErrorRes", None)
@@ -96,6 +98,19 @@ class CTraderClient:
         elif host in ("live.ctraderapi.com",):
             host = EndPoints.PROTOBUF_LIVE_HOST
 
+        if not reactor.running:
+            reactor_thread = threading.Thread(target=reactor.run, args=(False,), daemon=True)
+            reactor_thread.start()
+            for _ in range(30):
+                if reactor.running:
+                    break
+                time.sleep(0.1)
+            else:
+                log.error("Twisted reactor failed to start")
+                return False
+            time.sleep(0.5)
+            log.info("Twisted reactor started in daemon thread")
+
         log.info(f"Connecting to cTrader: {host}:{self.port}")
         self._client = Client(host, self.port, TcpProtocol)
 
@@ -103,24 +118,23 @@ class CTraderClient:
         self._client.setDisconnectedCallback(self._on_disconnect)
         self._client.setMessageReceivedCallback(self._on_message)
 
-        if not reactor.running:
-            reactor_thread = threading.Thread(target=reactor.run, args=(False,), daemon=True)
-            reactor_thread.start()
-            log.info("Twisted reactor started in daemon thread")
+        reactor.callFromThread(self._client.startService)
 
-        self._client.startService()
-
-        if not self._connected.wait(timeout=15):
-            log.error("TCP connection timeout")
+        log.info("Waiting for TCP connection...")
+        if not self._connected.wait(timeout=30):
+            log.error("TCP connection timeout after 30s")
+            log.error(f"  host={host} port={self.port}")
+            log.error(f"  reactor.running={reactor.running}")
             return False
 
         log.info("TCP connected, authenticating app...")
         app_auth = ProtoOAApplicationAuthReq()
         app_auth.clientId = self.client_id
         app_auth.clientSecret = self.client_secret
-        app_res = self._send_and_wait(app_auth, "ProtoOAApplicationAuthRes", timeout=10)
+        app_res = self._send_and_wait(app_auth, "ProtoOAApplicationAuthRes", timeout=15)
         if app_res is None:
             log.error("App auth failed — no response")
+            log.error("Check: client_id, client_secret are correct in CTRADER_CONFIG")
             return False
         log.info("App auth OK")
 
@@ -131,11 +145,13 @@ class CTraderClient:
         acc_auth = ProtoOAAccountAuthReq()
         acc_auth.ctidTraderAccountId = self.account_id
         acc_auth.accessToken = self.access_token
-        acc_res = self._send_and_wait(acc_auth, "ProtoOAAccountAuthRes", timeout=10)
+        acc_res = self._send_and_wait(acc_auth, "ProtoOAAccountAuthRes", timeout=15)
         if acc_res is None:
             err = self._responses.get("ProtoOAErrorRes")
             if err:
                 log.error(f"Account auth error: {getattr(err, 'errorCode', '?')} {getattr(err, 'description', '?')}")
+            else:
+                log.error("Account auth failed — no response. Check access_token and account_id.")
             return False
         log.info("Account auth OK")
         self._authed = True
@@ -175,8 +191,8 @@ class CTraderClient:
         return configured
 
     def _on_connect(self, client):
+        log.info(f"cTrader TCP connected to {self.host}:{self.port}")
         self._connected.set()
-        log.info("cTrader TCP connected")
 
     def _on_disconnect(self, client, reason):
         self._connected.clear()
@@ -295,7 +311,7 @@ class CTraderClient:
                 req.ctidTraderAccountId = self.account_id
                 for sid in sym_ids:
                     req.symbolId.append(sid)
-                self._client.send(req)
+                reactor.callFromThread(self._client.send, req)
                 self._subscribed_symbols.update(sym_ids)
                 log.info(f"Subscribed to spots for {len(sym_ids)} main symbols")
             except Exception as e:
@@ -305,7 +321,10 @@ class CTraderClient:
         with self._lock:
             if self._client:
                 try:
-                    self._client.stopService()
+                    if reactor.running:
+                        reactor.callFromThread(self._client.stopService)
+                    else:
+                        self._client.stopService()
                 except Exception:
                     pass
             self._connected.clear()
@@ -344,9 +363,10 @@ class CTraderClient:
         return 5
 
     def _price_from_raw(self, raw_val, digits=None):
-        
-        
-        return float(raw_val) / 100000.0
+        if digits is None:
+            digits = 5
+        divisor = 10 ** digits
+        return float(raw_val) / divisor
 
     def account_info(self):
         with self._lock:
@@ -538,7 +558,7 @@ class CTraderClient:
             req.ctidTraderAccountId = self.account_id
             for sid in new_ids:
                 req.symbolId.append(sid)
-            self._client.send(req)
+            reactor.callFromThread(self._client.send, req)
             self._subscribed_symbols.update(new_ids)
             log.debug(f"Subscribed to spots: {new_ids}")
         except Exception as e:
@@ -639,7 +659,7 @@ class CTraderClient:
                 ev = threading.Event()
                 self._events["ProtoOAExecutionEvent"] = ev
                 self._events["ProtoOAOrderErrorEvent"] = ev
-                self._client.send(req)
+                reactor.callFromThread(self._client.send, req)
                 ev.wait(timeout=self._timeout)
 
                 result = _OrderResult()
@@ -678,7 +698,7 @@ class CTraderClient:
                 ev = threading.Event()
                 self._events["ProtoOAExecutionEvent"] = ev
                 self._events["ProtoOAOrderErrorEvent"] = ev
-                self._client.send(req)
+                reactor.callFromThread(self._client.send, req)
                 ev.wait(timeout=self._timeout)
 
                 result = _OrderResult()
@@ -723,7 +743,7 @@ class CTraderClient:
                 ev = threading.Event()
                 self._events["ProtoOAExecutionEvent"] = ev
                 self._events["ProtoOAOrderErrorEvent"] = ev
-                self._client.send(req)
+                reactor.callFromThread(self._client.send, req)
 
                 ev.wait(timeout=self._timeout)
 

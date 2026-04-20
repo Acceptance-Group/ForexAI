@@ -110,8 +110,8 @@ CTRADER_CONFIG = {
     "port": 5035,                           
     "client_id": "25719_p6KKm1idyxlgQmGIna3j0Vx3E3yaSkmUd2IE5HfVjogt59hkDY",
     "client_secret": "VGcTNNc0SlPQ3bAVktCWQnsQcVW5RNlEVit14EsjZtolEx4RTz",
-    "access_token": "Wf0y4aaLLsbvaMRvlQnyp_uWixAIC2lQEG4iIIwICKI",
-    "refresh_token": "UczvFq7BsK99J9PNxghS-18kGTyBeV1B1dkEXBplrAc",
+    "access_token": "lVzMNV8ausipifL5dX4rcQlxqtgo4QFhFhyNLSQ6kwI",
+    "refresh_token": "Ps7s7QOcDrPPm3LL02zSFEP409g_3JkwkwctzsvCsWI",
     "account_id": 46995819,                  
     "symbol": "EURUSD",
 }

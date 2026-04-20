@@ -1,6 +1,7 @@
 import pandas as pd
 
-df = pd.read_csv(r'C:\Users\moonway\Desktop\fin_model\backtest\backtest_results_vol.csv')
+import os
+df = pd.read_csv(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backtest', 'backtest_results_vol.csv'))
 trades = df[df['signal'] != 0]
 wins = trades[trades['pips'] > 0]
 losses = trades[trades['pips'] <= 0]

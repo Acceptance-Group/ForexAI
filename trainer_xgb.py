@@ -166,7 +166,7 @@ def run_training():
 
     if best_model is not None:
         os.makedirs(os.path.dirname(MODEL_SAVE_PATH), exist_ok=True)
-        best_model.save_model(MODEL_SAVE_PATH.replace(".pth", ".json"))
+        best_model.get_booster().save_model(MODEL_SAVE_PATH.replace(".pth", ".json"))
         print(f"\nBest XGBoost model saved (DA={best_da_overall:.1f}%)")
 
         importances = best_model.feature_importances_

@@ -2,7 +2,7 @@ import json
 import os
 import time
 import threading
-import datetime
+import datetime as _dt
 import pickle
 import numpy as np
 import pandas as pd
@@ -15,6 +15,14 @@ from config import (
 )
 from data_loader import build_dataset, load_raw_prices, compute_atr, compute_adx
 from broker import init_broker, get_broker, shutdown_broker
+
+
+def _utcnow():
+    return _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+
+
+def _utciso():
+    return _utcnow().isoformat()
 
 VOL_MODEL_PATH = "models/vol_model.json"
 VOL_SCALER_PATH = "models/vol_scaler.pkl"
@@ -36,6 +44,102 @@ _cached_analysis = None
 _cached_analysis_ts = 0
 _broker_lock = threading.Lock()
 _broker_connected = False
+
+
+def _broker_keepalive():
+    global _broker_connected, _cached_account, _cached_candles, cached_candles, cached_candles_ts
+
+    while True:
+        time.sleep(5)
+        try:
+            if not _broker_connected:
+                print("Broker keepalive: connecting...")
+                try:
+                    shutdown_broker()
+                except Exception:
+                    pass
+                if init_broker():
+                    _broker_connected = True
+                    print("Broker keepalive: connected!")
+                else:
+                    print("Broker keepalive: failed, retry in 10s")
+                    time.sleep(10)
+                    continue
+
+            try:
+                broker = get_broker()
+                info = broker.account_info()
+                if info is not None:
+                    _broker_connected = True
+                    positions = broker.positions_get(symbol=SYMBOL)
+                    pos_list = []
+                    if positions:
+                        for p in positions:
+                            pos_list.append({
+                                "ticket": p.ticket,
+                                "symbol": p.symbol,
+                                "type": "BUY" if p.type == 0 else "SELL",
+                                "volume": p.volume,
+                                "price_open": p.price_open,
+                                "price_current": p.price_current,
+                                "sl": p.sl,
+                                "tp": p.tp,
+                                "profit": p.profit,
+                                "time": p.time.isoformat() if p.time and isinstance(p.time, _dt.datetime) else "",
+                            })
+                    tick = broker.symbol_info_tick(SYMBOL)
+                    result = {
+                        "balance": info.balance,
+                        "equity": info.equity,
+                        "profit": info.profit,
+                        "margin": info.margin,
+                        "free_margin": info.margin_free,
+                        "leverage": info.leverage,
+                        "server": info.server,
+                        "positions": pos_list,
+                        "bid": round(tick.bid, 5) if tick and tick.bid > 0 else 0,
+                        "ask": round(tick.ask, 5) if tick and tick.ask > 0 else 0,
+                        "spread": round((tick.ask - tick.bid) * 100000, 1) if tick and tick.ask > 0 and tick.bid > 0 and tick.ask > tick.bid else 0,
+                        "connected": True,
+                    }
+                    _cached_account = result
+                    _cached_account_ts = time.time()
+                else:
+                    _broker_connected = False
+            except Exception as e:
+                print(f"Broker keepalive error: {e}")
+                _broker_connected = False
+                try:
+                    shutdown_broker()
+                except Exception:
+                    pass
+
+            try:
+                if _broker_connected:
+                    broker = get_broker()
+                    tf_d1 = broker.TIMEFRAME_D1
+                    rates = broker.copy_rates_from_pos(SYMBOL, tf_d1, 0, 200)
+                    if rates is not None and len(rates) > 0:
+                        candles = []
+                        for r in rates:
+                            dt = _dt.datetime.fromtimestamp(r["time"])
+                            candles.append({
+                                "time": int(r["time"]),
+                                "date": dt.strftime("%Y-%m-%d"),
+                                "open": round(float(r["open"]), 5),
+                                "high": round(float(r["high"]), 5),
+                                "low": round(float(r["low"]), 5),
+                                "close": round(float(r["close"]), 5),
+                                "volume": int(r["tick_volume"]),
+                            })
+                        cached_candles = candles
+                        cached_candles_ts = time.time()
+            except Exception as e:
+                print(f"Candle update error: {e}")
+
+        except Exception as e:
+            print(f"Broker keepalive outer error: {e}")
+            time.sleep(10)
 
 
 def ensure_broker():
@@ -191,7 +295,7 @@ def compute_signal(force_refresh=False):
             reasons.append(f"P(UP)={dir_prob:.3f} in [{no_trade_sell_below}, {no_trade_buy_above}]")
 
         sig = {
-            "timestamp": datetime.datetime.utcnow().isoformat(),
+            "timestamp": _utciso(),
             "signal": signal,
             "prob_up": float(dir_prob),
             "mr_prob": float(mr_prob),
@@ -212,7 +316,7 @@ def compute_signal(force_refresh=False):
         _cached_signal_ts = time.time()
         return sig
     except Exception as e:
-        err = {"timestamp": datetime.datetime.utcnow().isoformat(), "signal": "ERROR", "error": str(e)}
+        err = {"timestamp": _utciso(), "signal": "ERROR", "error": str(e)}
         _cached_signal = err
         _cached_signal_ts = time.time()
         return err
@@ -302,96 +406,11 @@ _ACCOUNT_CACHE_TTL = 10
 
 
 def get_account_info():
-    global _cached_account, _cached_account_ts
-    now = time.time()
-    if _cached_account and (now - _cached_account_ts) < _ACCOUNT_CACHE_TTL:
-        return _cached_account
-
-    if not _broker_connected:
-        try:
-            with _broker_lock:
-                broker = get_broker()
-                info = broker.account_info()
-        except Exception:
-            return _cached_account if _cached_account else {"connected": False}
-
-    try:
-        broker = get_broker()
-        info = broker.account_info()
-        if info is None:
-            return _cached_account if _cached_account else {"connected": False}
-        positions = broker.positions_get(symbol=SYMBOL)
-        pos_list = []
-        if positions:
-            for p in positions:
-                pos_list.append({
-                    "ticket": p.ticket,
-                    "symbol": p.symbol,
-                    "type": "BUY" if p.type == 0 else "SELL",
-                    "volume": p.volume,
-                    "price_open": p.price_open,
-                    "price_current": p.price_current,
-                    "sl": p.sl,
-                    "tp": p.tp,
-                    "profit": p.profit,
-                    "time": p.time.isoformat() if p.time and isinstance(p.time, datetime.datetime) else "",
-                })
-        tick = broker.symbol_info_tick(SYMBOL)
-        result = {
-            "balance": info.balance,
-            "equity": info.equity,
-            "profit": info.profit,
-            "margin": info.margin,
-            "free_margin": info.margin_free,
-            "leverage": info.leverage,
-            "server": info.server,
-            "positions": pos_list,
-            "bid": tick.bid if tick else 0,
-            "ask": tick.ask if tick else 0,
-            "spread": (tick.ask - tick.bid) * 100000 if tick else 0,
-            "connected": True,
-        }
-        _cached_account = result
-        _cached_account_ts = now
-        return result
-    except Exception:
-        return _cached_account if _cached_account else {"connected": False}
+    return _cached_account if _cached_account else {"connected": False}
 
 
 def get_candles(count=200):
-    global cached_candles, cached_candles_ts
-    now = time.time()
-    if cached_candles is not None and (now - cached_candles_ts) < 30:
-        return cached_candles
-
-    try:
-        with _broker_lock:
-            if not _broker_connected and not ensure_broker():
-                return cached_candles or []
-            broker = get_broker()
-            tf_d1 = broker.TIMEFRAME_D1
-            rates = broker.copy_rates_from_pos(SYMBOL, tf_d1, 0, count)
-        if rates is None or len(rates) == 0:
-            return cached_candles or []
-
-        candles = []
-        for r in rates:
-            dt = datetime.datetime.fromtimestamp(r["time"])
-            candles.append({
-                "time": int(r["time"]),
-                "date": dt.strftime("%Y-%m-%d"),
-                "open": round(float(r["open"]), 5),
-                "high": round(float(r["high"]), 5),
-                "low": round(float(r["low"]), 5),
-                "close": round(float(r["close"]), 5),
-                "volume": int(r["tick_volume"]),
-            })
-        cached_candles = candles
-        cached_candles_ts = now
-        return candles
-    except Exception as e:
-        print(f"Error fetching candles: {e}")
-        return cached_candles or []
+    return cached_candles or []
 
 
 def get_signal_markers():
@@ -436,6 +455,9 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--bg0);color:var(--
 .dot{width:7px;height:7px;border-radius:50%}
 .dot-on{background:var(--grn);box-shadow:0 0 8px var(--grn);animation:blink 2s infinite}
 .dot-off{background:var(--red)}
+#bot-pill{font-weight:700;font-size:11px;letter-spacing:1px}
+#bot-pill.bot-on{background:rgba(0,230,118,.15);color:var(--grn);border:1px solid rgba(0,230,118,.4)}
+#bot-pill.bot-off{background:rgba(255,196,0,.1);color:var(--yel);border:1px solid rgba(255,196,0,.3)}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
 
 .layout{display:grid;grid-template-columns:1fr 320px;gap:8px;margin-bottom:8px}
@@ -528,6 +550,7 @@ tr:hover td{background:var(--bg3)}
       </div>
     </div>
     <div class="topbar-r">
+      <div class="pill" id="bot-pill" style="display:none"><span id="bot-txt">BOT OFF</span></div>
       <div class="pill"><div class="dot" id="conn-dot"></div><span id="conn-txt">Connecting...</span></div>
       <div class="pill" id="server-name">--</div>
     </div>
@@ -703,6 +726,15 @@ function updateUI(data){
     document.getElementById('conn-txt').textContent=conn?'cTrader Live':'Offline';
     document.getElementById('server-name').textContent=conn?brk.server:'--';
 
+    const bp=document.getElementById('bot-pill');
+    const bt=document.getElementById('bot-txt');
+    if(data.bot_status&&data.bot_status.running){
+      bp.className='pill bot-on';bt.textContent='BOT ACTIVE';bp.style.display='flex';
+    }else{
+      bp.className='pill bot-off';bt.textContent='BOT OFF';bp.style.display='flex';
+    }
+    document.getElementById('server-name').textContent=conn?brk.server:'--';
+
     const lp=document.getElementById('live-price');
     const pc=document.getElementById('price-chg');
     if(conn&&brk.bid){
@@ -856,8 +888,11 @@ def dashboard():
 
 @app.route("/api/status")
 def api_status():
-    broker_info = get_account_info()
-    sig = _cached_signal if _cached_signal else {"signal": "PENDING", "timestamp": datetime.datetime.utcnow().isoformat()}
+    try:
+        broker_info = get_account_info()
+    except Exception:
+        broker_info = {"connected": False}
+    sig = _cached_signal if _cached_signal else {"signal": "PENDING", "timestamp": _utciso()}
     if not _cached_signal:
         threading.Thread(target=_bg_compute_signal, daemon=True).start()
 
@@ -872,7 +907,7 @@ def api_status():
     equity_history = []
     balance = broker_info.get("balance", 10000) if broker_info and broker_info.get("connected") else 10000
     equity = broker_info.get("equity", balance) if broker_info and broker_info.get("connected") else balance
-    equity_history.append({"time": datetime.datetime.utcnow().isoformat(), "equity": equity})
+    equity_history.append({"time": _utciso(), "equity": equity})
     for t in trade_history[-100:]:
         equity_history.append({
             "time": t.get("timestamp", ""),
@@ -890,9 +925,12 @@ def api_status():
         "short_wins": short_wins, "short_total": short_total,
     }
 
-    candles = get_candles(200)
+    candles = get_candles(200) or []
     markers = get_signal_markers()
-    analysis = get_chart_analysis(200)
+    try:
+        analysis = get_chart_analysis(200) or []
+    except Exception:
+        analysis = []
 
     return jsonify({
         "broker": broker_info or {},
@@ -973,6 +1011,8 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
 
     if not init_broker():
         print("Cannot connect to broker! Starting dashboard anyway...")
+    else:
+        _broker_connected = True
 
     bot_status["running"] = True
     last_trade_date = None
@@ -981,7 +1021,7 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
         nonlocal last_trade_date
         while True:
             try:
-                now = datetime.datetime.utcnow()
+                now = _utcnow()
                 today = now.strftime("%Y-%m-%d")
 
                 if now.hour == 0 and now.minute < 10 and today != last_trade_date:
@@ -1029,6 +1069,9 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.start()
 
+    keepalive_thread = threading.Thread(target=_broker_keepalive, daemon=True)
+    keepalive_thread.start()
+
     app.run(host=host, port=port, debug=False, use_reloader=False)
 
 
@@ -1054,7 +1097,7 @@ if __name__ == "__main__":
         print("|__/    \\______/ |__/       \\_______/|__/  \\__/|__/  |__/|______/")
         print("powered by moonway")
         print("=" * 60)
-        threading.Thread(target=ensure_broker, daemon=True).start()
+        threading.Thread(target=_broker_keepalive, daemon=True).start()
         load_logs()
         bot_status["running"] = False
         app.run(host="0.0.0.0", port=5000, debug=False)

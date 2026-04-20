@@ -13,6 +13,11 @@ from config import (
 from data_loader import build_dataset, load_raw_prices, compute_atr, compute_adx
 from broker import init_broker, get_broker, shutdown_broker
 
+
+def _utcnow():
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+
 SYMBOL = "EURUSD"
 
 VOL_MODEL_PATH = "models/vol_model.json"
@@ -174,7 +179,7 @@ def build_signal():
         print(f"  Vol filter: {current_vol:.5f} <= threshold {vol_threshold:.5f} - filtered")
 
     print(f"\n{'='*60}")
-    print(f"  D1 EURUSD Signal ({datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC)")
+    print(f"  D1 EURUSD Signal ({_utcnow().strftime('%Y-%m-%d %H:%M')} UTC)")
     print(f"{'='*60}")
     print(f"  P(UP)          : {dir_prob:.4f}")
     print(f"  Predicted ATR  : {current_vol:.5f} (threshold: {vol_threshold:.5f})")
@@ -282,7 +287,7 @@ def manage_trailing_stop(order_info, symbol=SYMBOL):
     trail_pips_val = TRAIL_PIPS / 10000
     max_hold_hours = MAX_HOLD_BARS * 24
 
-    start_time = datetime.datetime.utcnow()
+    start_time = _utcnow()
     be_triggered = False
     highest = entry if is_buy else entry
     lowest = entry if is_buy else entry
@@ -301,7 +306,7 @@ def manage_trailing_stop(order_info, symbol=SYMBOL):
         ask, _ = get_current_price(symbol)
         current_price = bid if is_buy else ask
         current_pnl = position.profit
-        elapsed = (datetime.datetime.utcnow() - start_time).total_seconds() / 3600
+        elapsed = (_utcnow() - start_time).total_seconds() / 3600
 
         if is_buy:
             highest = max(highest, bid)
@@ -404,7 +409,7 @@ def run_bot_d1():
     last_trade_date = None
     try:
         while True:
-            now = datetime.datetime.utcnow()
+            now = _utcnow()
             today = now.strftime("%Y-%m-%d")
 
             if now.hour == 0 and now.minute < 5 and today != last_trade_date:

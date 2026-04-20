@@ -1,12 +1,15 @@
+import os
 import sys
 import subprocess
+
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def run(cmd, desc):
     print(f"\n{'='*70}")
     print(f"  {desc}")
     print(f"{'='*70}")
-    result = subprocess.run(cmd, shell=True, cwd=r"C:\Users\moonway\Desktop\fin_model")
+    result = subprocess.run(cmd, shell=True, cwd=PROJECT_DIR)
     if result.returncode != 0:
         print(f"\n  ERROR: {desc} failed with code {result.returncode}")
         return False

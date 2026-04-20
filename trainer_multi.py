@@ -114,7 +114,7 @@ def run_volatility_training():
     avg_vd = np.mean([r["vol_dir"] for r in fold_results])
     print(f"\n  VOL MODEL: Avg R2={avg_r2:.3f} | Avg Corr={avg_corr:.3f} | Avg VolDir={avg_vd:.1f}% | Best R2={best_r2:.3f}")
 
-    best_model.save_model(VOL_MODEL_PATH)
+    best_model.get_booster().save_model(VOL_MODEL_PATH)
     print(f"  Saved to {VOL_MODEL_PATH}")
 
     importances = best_model.feature_importances_
@@ -328,7 +328,7 @@ def run_meanrev_training():
 
     avg_da = np.mean(fold_results)
     print(f"  MeanRev Model: Avg DA={avg_da:.1f}%, Best={best_da:.1f}%")
-    best_model.save_model(MEANREV_MODEL_PATH)
+    best_model.get_booster().save_model(MEANREV_MODEL_PATH)
     print(f"  Saved to {MEANREV_MODEL_PATH}")
     return best_model, scaler
 

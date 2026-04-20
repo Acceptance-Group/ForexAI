@@ -1,10 +1,14 @@
 import io
 import os
+import logging
 
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
 
 from config import (
     YFINANCE_TICKERS, FRED_SERIES, DATA_CONFIG,
