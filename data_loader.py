@@ -346,6 +346,13 @@ def engineer_d1_features(d1, macro, cross_data, intraday_data, calendar):
         h4_body = (h4_aligned["close"] - h4_aligned["open"]).abs() / (h4_aligned["high"] - h4_aligned["low"] + 1e-10)
         df["h4_body_pct"] = h4_body.fillna(0)
 
+    lookback = DATA_CONFIG.get("lookback", 1)
+    lag_cols = ["d1_log_return", "atr_norm", "adx", "rsi"]
+    for col in lag_cols:
+        if col in df.columns:
+            for lag in range(2, lookback + 1):
+                df[f"{col}_l{lag}"] = df[col].shift(lag - 1)
+
     df = df.shift(1)
 
     if len(calendar) > 0:

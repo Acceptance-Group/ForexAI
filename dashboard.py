@@ -238,9 +238,10 @@ def compute_signal(force_refresh=False):
             vol_scaler = pickle.load(f)
         vol_scaled = vol_scaler.transform(feats_df.values)
         vol_pred = vol_model.predict(vol_scaled)
-        vol_median = np.median(vol_pred[:int(len(vol_pred) * 0.7)])
+        vol_pct = pd.Series(vol_pred).rolling(252, min_periods=30).quantile(0.20).values
+        vol_threshold = float(vol_pct[-1]) if not pd.isna(vol_pct[-1]) else float(np.median(vol_pred))
         current_vol = vol_pred[-1]
-        vol_high = current_vol > vol_median
+        vol_high = current_vol > vol_threshold
 
         mr_model = xgb.XGBClassifier()
         mr_model.load_model(MEANREV_MODEL_PATH)
@@ -290,7 +291,7 @@ def compute_signal(force_refresh=False):
             reasons.append(f"ADX {current_adx:.2f} < {min_adx}")
         if signal != "HOLD" and not vol_high:
             signal = "HOLD"
-            reasons.append(f"Vol {current_vol:.5f} <= median {vol_median:.5f}")
+            reasons.append(f"Vol {current_vol:.5f} <= pct20 {vol_threshold:.5f}")
         if signal == "HOLD" and not reasons:
             reasons.append(f"P(UP)={dir_prob:.3f} in [{no_trade_sell_below}, {no_trade_buy_above}]")
 
@@ -300,7 +301,7 @@ def compute_signal(force_refresh=False):
             "prob_up": float(dir_prob),
             "mr_prob": float(mr_prob),
             "vol_pred": float(current_vol),
-            "vol_median": float(vol_median),
+            "vol_pct20": float(vol_threshold),
             "vol_high": bool(vol_high),
             "adx": float(current_adx),
             "atr_pips": float(atr_pips),
@@ -348,7 +349,7 @@ def get_chart_analysis(n_bars=200):
             vol_scaler = pickle.load(f)
         vol_scaled = vol_scaler.transform(feats_df.values)
         vol_pred_all = vol_model.predict(vol_scaled)
-        vol_median = np.median(vol_pred_all[:int(len(vol_pred_all) * 0.7)])
+        vol_pct = pd.Series(vol_pred_all).rolling(252, min_periods=30).quantile(0.20).values
 
         close = prices_df["close"].values
         high = prices_df["high"].values
@@ -364,7 +365,7 @@ def get_chart_analysis(n_bars=200):
         start = max(0, len(feats_df) - n_bars)
         for i in range(start, len(feats_df)):
             p = prob_up_all[i]
-            vh = bool(vol_pred_all[i] > vol_median)
+            vh = bool(vol_pred_all[i] > (vol_pct[i] if i < len(vol_pct) and not pd.isna(vol_pct[i]) else np.median(vol_pred_all)))
             ax = float(adx_series.iloc[i])
             atr = float(atr_series.iloc[i])
 
@@ -785,7 +786,8 @@ function updateUI(data){
         let frHTML='';
         const adxOk=(sig.adx||0)>=0.3;
         frHTML+='<div class="filter-row '+(adxOk?'pass':'block')+'"><div class="filter-dot '+(adxOk?'on':'off')+'"></div> ADX '+(sig.adx||0).toFixed(2)+' '+(adxOk?'>= 0.30':'< 0.30')+'</div>';
-        frHTML+='<div class="filter-row '+(sig.vol_high?'pass':'block')+'"><div class="filter-dot '+(sig.vol_high?'on':'off')+'"></div> Vol '+(sig.vol_high?'> median':'<= median')+'</div>';
+        var vThresh=sig.vol_pct20?(sig.vol_pct20*10000).toFixed(1)+'p':'--';
+        frHTML+='<div class="filter-row '+(sig.vol_high?'pass':'block')+'"><div class="filter-dot '+(sig.vol_high?'on':'off')+'"></div> Vol '+(sig.vol_high?'> pct20 '+vThresh:'<= pct20 '+vThresh)+'</div>';
         if(sig.reasons&&sig.reasons.length){
             sig.reasons.forEach(r=>{
                 frHTML+='<div class="filter-row block"><div class="filter-dot off"></div> '+r+'</div>';
@@ -794,7 +796,7 @@ function updateUI(data){
         document.getElementById('filter-rows').innerHTML=frHTML;
 
         const pClass=s>0.6?'g':p<0.45?'r':'y';
-        document.getElementById('ai-log').innerHTML='P(UP)=<b class="'+pClass+'">'+p.toFixed(4)+'</b> | Vol=<b class="'+(sig.vol_high?'g':'r')+'">'+(sig.vol_high?'HIGH':'LOW')+'</b> | ADX=<b class="'+(adxOk?'g':'r')+'">'+(sig.adx||0).toFixed(2)+'</b> &rarr; <b class="'+pClass+'">'+s+'</b>';
+        document.getElementById('ai-log').innerHTML='P(UP)=<b class="'+pClass+'">'+p.toFixed(4)+'</b> | Vol=<b class="'+(sig.vol_high?'g':'r')+'">'+(sig.vol_high?'HIGH':'LOW')+'</b> ('+(sig.vol_pred?(sig.vol_pred*10000).toFixed(1):'?')+'p vs '+(sig.vol_pct20?(sig.vol_pct20*10000).toFixed(1):'?')+'p pct20) | ADX=<b class="'+(adxOk?'g':'r')+'">'+(sig.adx||0).toFixed(2)+'</b> &rarr; <b class="'+pClass+'">'+s+'</b>';
     }
 
     const posB=document.getElementById('pos-body');
@@ -994,8 +996,11 @@ def api_signal():
     return jsonify(sig)
 
 
+_active_order_info = None
+
+
 def run_bot_with_dashboard(host="0.0.0.0", port=5000):
-    from trader_d1 import init_broker, build_signal, get_open_position, close_position, place_order, SYMBOL, BREAKEVEN_PIPS, TRAIL_PIPS
+    from trader_d1 import build_signal, get_open_position, close_position, place_order, modify_sl, get_current_price, SYMBOL, BREAKEVEN_PIPS, TRAIL_PIPS, MAX_HOLD_BARS
 
     print(f"\n{'='*60}")
     print(" /$$$$$$$$                                       /$$$$$$  /$$$$$$")
@@ -1012,6 +1017,7 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
     if not init_broker():
         print("Cannot connect to broker! Starting dashboard anyway...")
     else:
+        global _broker_connected
         _broker_connected = True
 
     bot_status["running"] = True
@@ -1019,6 +1025,7 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
 
     def bot_loop():
         nonlocal last_trade_date
+        global _active_order_info
         while True:
             try:
                 now = _utcnow()
@@ -1034,43 +1041,106 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
                         bot_status["errors"] = bot_status.get("errors", [])[-5:]
 
                         if signal != "HOLD":
-                            from trader_d1 import init_broker as tb_init2, run_trading_cycle, shutdown_broker as tb_shut2
-                            if tb_init2():
-                                try:
-                                    result = run_trading_cycle()
-                                    if result:
-                                        try:
-                                            broker = get_broker()
-                                            info = broker.account_info()
-                                            equity_before = info.equity if info else 0
-                                        except Exception:
-                                            equity_before = 0
-                                        trade_data = {
-                                            "timestamp": now.isoformat(),
-                                            "signal": signal,
-                                            "side": signal,
-                                            "prob_up": sig.get("prob_up", 0),
-                                            "vol_pred": sig.get("vol_pred", 0),
-                                            "adx": sig.get("adx", 0),
-                                            "equity_before": equity_before,
-                                        }
-                                        save_trade(trade_data)
-                                finally:
-                                    tb_shut2()
+                            sig_info = build_signal()
+                            existing = get_open_position()
+                            if existing is not None:
+                                pos_type = "BUY" if existing.type == 0 else "SELL"
+                                same_dir = (pos_type == "BUY" and signal == "BUY") or (pos_type == "SELL" and signal == "SELL")
+                                if same_dir:
+                                    print(f"  Already in {pos_type} matching {signal}. Holding.")
+                                else:
+                                    print(f"  Closing {pos_type} (new signal: {signal})...")
+                                    close_position(existing)
+                                    time.sleep(1)
+                                    existing = None
+
+                            if existing is None:
+                                order_info = place_order(sig_info)
+                                if order_info:
+                                    _active_order_info = order_info
+                                    try:
+                                        broker = get_broker()
+                                        info = broker.account_info()
+                                        equity_before = info.equity if info else 0
+                                    except Exception:
+                                        equity_before = 0
+                                    trade_data = {
+                                        "timestamp": now.isoformat(),
+                                        "signal": signal,
+                                        "side": signal,
+                                        "prob_up": sig.get("prob_up", 0),
+                                        "vol_pred": sig.get("vol_pred", 0),
+                                        "adx": sig.get("adx", 0),
+                                        "equity_before": equity_before,
+                                    }
+                                    save_trade(trade_data)
+                        else:
+                            print(f"  Signal: HOLD, no trade.")
                         last_trade_date = today
                     except Exception as e:
                         bot_status["errors"] = bot_status.get("errors", []) + [str(e)]
+                        print(f"  Bot trade error: {e}")
 
                 time.sleep(60)
             except Exception as e:
                 bot_status["errors"] = bot_status.get("errors", []) + [str(e)]
                 time.sleep(60)
 
+    def trailing_loop():
+        global _active_order_info
+        while True:
+            time.sleep(60)
+            try:
+                if not _broker_connected:
+                    continue
+                position = get_open_position()
+                if position is None:
+                    if _active_order_info is not None:
+                        print("  Position closed (TP/SL hit)")
+                        _active_order_info = None
+                    continue
+
+                is_buy = position.type == 0
+                entry = position.price_open
+                current_sl = position.sl
+                ask, bid = get_current_price()
+                if not ask or not bid:
+                    continue
+
+                be_price = entry + (1 / 10000 if is_buy else -1 / 10000)
+                be_triggered = (is_buy and current_sl >= be_price) or (not is_buy and current_sl <= be_price)
+
+                if is_buy:
+                    if be_triggered:
+                        trail_sl = bid - TRAIL_PIPS / 10000
+                        if trail_sl > current_sl and trail_sl > entry:
+                            modify_sl(position, trail_sl)
+                    else:
+                        unrealized = (bid - entry) * 10000
+                        if unrealized >= BREAKEVEN_PIPS:
+                            new_sl = entry + 1 / 10000
+                            modify_sl(position, new_sl)
+                else:
+                    if be_triggered:
+                        trail_sl = ask + TRAIL_PIPS / 10000
+                        if trail_sl < current_sl and trail_sl < entry:
+                            modify_sl(position, trail_sl)
+                    else:
+                        unrealized = (entry - ask) * 10000
+                        if unrealized >= BREAKEVEN_PIPS:
+                            new_sl = entry - 1 / 10000
+                            modify_sl(position, new_sl)
+            except Exception as e:
+                print(f"  Trailing loop error: {e}")
+
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.start()
 
     keepalive_thread = threading.Thread(target=_broker_keepalive, daemon=True)
     keepalive_thread.start()
+
+    trailing_thread = threading.Thread(target=trailing_loop, daemon=True)
+    trailing_thread.start()
 
     app.run(host=host, port=port, debug=False, use_reloader=False)
 

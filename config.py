@@ -5,7 +5,7 @@ DATA_CONFIG = {
     "end_date": "2026-04-14",
     "parquet_path": "data/eurusd_d1_features.parquet",
     "raw_parquet_path": "data/eurusd_d1_raw.parquet",
-    "lookback": 1,
+    "lookback": 10,
     "barrier_tp": 0.010,
     "barrier_sl": 0.005,
     "barrier_max_bars": 20,
@@ -27,20 +27,29 @@ DATA_CONFIG = {
     "max_hold_bars": 10,
 }
 
-FEATURE_COLUMNS = [
-    "d1_log_return", "d1_ret_3", "d1_ret_5", "d1_ret_10", "d1_ret_20",
-    "dxy_momentum",
-    "atr_norm", "adx", "rsi",
-    "macd_hist",
-    "body_ratio", "lower_shadow_pct",
-    "vol_sma_ratio",
-    "trend_ma20", "trend_ma50",
-    "vwap_ratio",
-    "gbpusd_ret_1", "gbpusd_ret_5", "gbpusd_corr_20",
-    "usdjpy_ret_1", "usdjpy_ret_5", "usdjpy_corr_20",
-    "h4_ret_last", "h4_ret_3d",
-    "h4_range_pct", "h4_body_pct",
-]
+LAG_FEATURES = ["d1_log_return", "atr_norm", "adx", "rsi"]
+
+def _build_feature_columns(lookback):
+    base = [
+        "d1_log_return", "d1_ret_3", "d1_ret_5", "d1_ret_10", "d1_ret_20",
+        "dxy_momentum",
+        "atr_norm", "adx", "rsi",
+        "macd_hist",
+        "body_ratio", "lower_shadow_pct",
+        "vol_sma_ratio",
+        "trend_ma20", "trend_ma50",
+        "vwap_ratio",
+        "gbpusd_ret_1", "gbpusd_ret_5", "gbpusd_corr_20",
+        "usdjpy_ret_1", "usdjpy_ret_5", "usdjpy_corr_20",
+        "h4_ret_last", "h4_ret_3d",
+        "h4_range_pct", "h4_body_pct",
+    ]
+    for col in LAG_FEATURES:
+        for lag in range(2, lookback + 1):
+            base.append(f"{col}_l{lag}")
+    return base
+
+FEATURE_COLUMNS = _build_feature_columns(DATA_CONFIG["lookback"])
 
 INPUT_DIM = len(FEATURE_COLUMNS)
 
@@ -84,7 +93,7 @@ TRAIN_CONFIG = {
 
 RISK_CONFIG = {
     "risk_per_trade": 0.02,
-    "max_leverage": 50.0,
+    "max_leverage": 100.0,
     "initial_equity": 10000.0,
     "pip_value_per_lot": 10.0,
     "lot_step": 0.01,
