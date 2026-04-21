@@ -184,3 +184,4 @@ cython_debug/
 /backtest
 
 signal_log.json
+/catboost_info

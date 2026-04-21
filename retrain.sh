@@ -10,7 +10,7 @@ echo " ForexAI — Retrain & Restart"
 echo "============================================"
 
 echo ""
-echo "[1/3] Training direction model..."
+echo "[1/3] Training direction ensemble (XGB+LGBM+CB)..."
 USE_ALL_DATA=1 python3 -u trainer_xgb.py
 
 echo ""

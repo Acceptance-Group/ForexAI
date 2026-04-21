@@ -15,6 +15,7 @@ from config import (
 )
 from data_loader import build_dataset, load_raw_prices, compute_atr, compute_adx
 from broker import init_broker, get_broker, shutdown_broker
+from ensemble import predict_direction_proba, predict_direction_proba_all
 
 
 def _utcnow():
@@ -225,12 +226,8 @@ def compute_signal(force_refresh=False):
         feats_df = feats_df.loc[common_idx]
         prices_df = prices_df.loc[common_idx]
 
-        with open(SCALER_SAVE_PATH, "rb") as f:
-            scaler = pickle.load(f)
-        dir_model = xgb.XGBClassifier()
-        dir_model.load_model(MODEL_SAVE_PATH.replace(".pth", ".json"))
-        scaled = scaler.transform(feats_df.values)
-        dir_prob = dir_model.predict_proba(scaled[-1:].reshape(1, -1))[0, 1]
+        dir_prob, dir_probs = predict_direction_proba(feats_df.values[-1:].reshape(1, -1))
+        dir_prob = float(dir_prob[0])
 
         vol_model = xgb.XGBRegressor()
         vol_model.load_model(VOL_MODEL_PATH)
@@ -299,6 +296,9 @@ def compute_signal(force_refresh=False):
             "timestamp": _utciso(),
             "signal": signal,
             "prob_up": float(dir_prob),
+            "prob_xgb": float(dir_probs["xgb"][0]),
+            "prob_lgbm": float(dir_probs["lgbm"][0]),
+            "prob_cb": float(dir_probs["cb"][0]),
             "mr_prob": float(mr_prob),
             "vol_pred": float(current_vol),
             "vol_pct20": float(vol_threshold),
@@ -336,12 +336,7 @@ def get_chart_analysis(n_bars=200):
         feats_df = feats_df.loc[common_idx]
         prices_df = prices_df.loc[common_idx]
 
-        with open(SCALER_SAVE_PATH, "rb") as f:
-            scaler = pickle.load(f)
-        dir_model = xgb.XGBClassifier()
-        dir_model.load_model(MODEL_SAVE_PATH.replace(".pth", ".json"))
-        scaled = scaler.transform(feats_df.values)
-        prob_up_all = dir_model.predict_proba(scaled)[:, 1]
+        prob_up_all, _ = predict_direction_proba_all(feats_df.values)
 
         vol_model = xgb.XGBRegressor()
         vol_model.load_model(VOL_MODEL_PATH)
@@ -580,6 +575,11 @@ tr:hover td{background:var(--bg3)}
         </div>
         <div class="prob-track"><div class="prob-fill" id="prob-fill" style="width:50%"></div></div>
         <div class="prob-labels"><span>0 &larr; SELL</span><span id="prob-num">0.50</span><span>BUY &rarr; 1</span></div>
+        <div id="ensemble-row" style="display:flex;gap:4px;justify-content:center;margin-bottom:6px;font-size:9px;font-family:'JetBrains Mono',monospace">
+          <span style="color:#448aff" id="ens-xgb">XGB --</span>
+          <span style="color:#00e676" id="ens-lgbm">LGBM --</span>
+          <span style="color:#ff9100" id="ens-cb">CB --</span>
+        </div>
         <div class="filters" id="filters">
           <div class="f-item"><div class="f-lbl">Vol Filter</div><div class="f-val" id="f-vol">--</div></div>
           <div class="f-item"><div class="f-lbl">ADX</div><div class="f-val" id="f-adx">--</div></div>
@@ -766,6 +766,12 @@ function updateUI(data){
 
         const p=sig.prob_up||0;
         document.getElementById('prob-num').textContent=p.toFixed(4);
+
+        if(sig.prob_xgb!==undefined){
+            document.getElementById('ens-xgb').textContent='XGB '+sig.prob_xgb.toFixed(3);
+            document.getElementById('ens-lgbm').textContent='LGBM '+sig.prob_lgbm.toFixed(3);
+            document.getElementById('ens-cb').textContent='CB '+sig.prob_cb.toFixed(3);
+        }
         const pf=document.getElementById('prob-fill');
         pf.style.width=(p*100)+'%';
         pf.style.background=p>0.6?'linear-gradient(90deg,#00e676,#00c853)':p<0.45?'linear-gradient(90deg,#ff1744,#d50000)':'linear-gradient(90deg,#ffc400,#ff9100)';

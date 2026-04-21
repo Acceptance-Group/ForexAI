@@ -10,10 +10,11 @@ import matplotlib.dates as mdates
 
 from config import (
     DATA_CONFIG, BACKTEST_CONFIG, RISK_CONFIG,
-    MODEL_SAVE_PATH, SCALER_SAVE_PATH,
+    SCALER_SAVE_PATH,
     FEATURE_COLUMNS,
 )
 from data_loader import load_raw_prices, compute_atr, compute_adx, build_dataset
+from ensemble import predict_direction_proba_all
 
 VOL_MODEL_PATH = "models/vol_model.json"
 VOL_SCALER_PATH = "models/vol_scaler.pkl"
@@ -44,11 +45,8 @@ def run_full_backtest():
     with open(SCALER_SAVE_PATH, "rb") as f:
         scaler = pickle.load(f)
 
-    scaled = scaler.transform(feats_df.values)
-
-    dir_model = xgb.XGBClassifier()
-    dir_model.load_model(MODEL_SAVE_PATH.replace(".pth", ".json"))
-    dir_probs = dir_model.predict_proba(scaled)[:, 1]
+    dir_probs_ens, dir_probs_detail = predict_direction_proba_all(feats_df.values)
+    dir_probs = dir_probs_ens
 
     vol_model = xgb.XGBRegressor()
     vol_model.load_model(VOL_MODEL_PATH)

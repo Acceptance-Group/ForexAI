@@ -1,18 +1,27 @@
 import os
 import pickle
+import warnings
 
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+import lightgbm as lgb
+from catboost import CatBoostClassifier
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import TimeSeriesSplit
+
+warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
 from config import (
     TRAIN_CONFIG, DATA_CONFIG, BACKTEST_CONFIG,
     MODEL_SAVE_PATH, SCALER_SAVE_PATH,
     FEATURE_COLUMNS, FEATURE_WEIGHTS,
 )
-from data_loader import load_dataset, load_raw_prices, load_labels, build_dataset, fetch_cross_symbols
+from data_loader import load_dataset, load_raw_prices, load_labels, build_dataset
+
+ENSEMBLE_DIR = "models"
+XGB_MODEL_PATH = os.path.join(ENSEMBLE_DIR, "dir_xgb.json")
+LGBM_MODEL_PATH = os.path.join(ENSEMBLE_DIR, "dir_lgbm.txt")
+CB_MODEL_PATH = os.path.join(ENSEMBLE_DIR, "dir_cb.cbm")
 
 
 def run_training():
@@ -53,9 +62,7 @@ def run_training():
         pickle.dump(scaler, f)
 
     y_binary = ((labels_df["label"].values + 1) / 2.0).astype(int)
-
     y_binary[y_binary == 0.5] = 0
-
     valid_mask = y_binary != -1
     X = scaled[valid_mask]
     y = y_binary[valid_mask]
@@ -63,25 +70,11 @@ def run_training():
 
     pos_ratio = y.sum() / len(y)
     neg_ratio = 1 - pos_ratio
-
     print(f"After removing FLAT: {len(y)} samples, UP={pos_ratio*100:.1f}%")
-    print(f"Feature weights will be applied as sample weights")
-
-    sample_weights = np.where(y == 1, 1.0 / (pos_ratio + 1e-10), 1.0 / (neg_ratio + 1e-10))
 
     wf_months = TRAIN_CONFIG["walk_forward_months"]
     val_months = TRAIN_CONFIG["val_months"]
     step_months = TRAIN_CONFIG["step_months"]
-
-    fold_results = []
-    best_da_overall = 0.0
-    best_model = None
-
-    start_date = dates[0]
-    end_date = dates[-1]
-    first_val_start = start_date + pd.DateOffset(months=wf_months)
-    current_val_start = first_val_start
-    fold = 0
 
     xgb_params = {
         "n_estimators": 300,
@@ -97,6 +90,45 @@ def run_training():
         "verbosity": 0,
         "n_jobs": -1,
     }
+
+    lgbm_params = {
+        "n_estimators": 300,
+        "max_depth": 4,
+        "learning_rate": 0.1,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "reg_alpha": 0.01,
+        "reg_lambda": 0.1,
+        "min_child_samples": 20,
+        "objective": "binary",
+        "verbosity": -1,
+        "n_jobs": -1,
+    }
+
+    cb_params = {
+        "iterations": 300,
+        "depth": 4,
+        "learning_rate": 0.1,
+        "subsample": 0.8,
+        "colsample_bylevel": 0.8,
+        "l2_leaf_reg": 0.1,
+        "min_data_in_leaf": 20,
+        "loss_function": "Logloss",
+        "verbose": 0,
+        "thread_count": -1,
+    }
+
+    fold_results = []
+    best_ens_da = 0.0
+    best_xgb = None
+    best_lgbm = None
+    best_cb = None
+
+    start_date = dates[0]
+    end_date = dates[-1]
+    first_val_start = start_date + pd.DateOffset(months=wf_months)
+    current_val_start = first_val_start
+    fold = 0
 
     while current_val_start + pd.DateOffset(months=val_months) <= end_date + pd.DateOffset(days=1):
         current_val_end = current_val_start + pd.DateOffset(months=val_months)
@@ -124,60 +156,73 @@ def run_training():
         print(f"  Train: {dates[train_mask_dates][0].strftime('%Y-%m-%d')} - {dates[train_mask_dates][-1].strftime('%Y-%m-%d')}")
         print(f"  Val:   {dates[val_mask_dates][0].strftime('%Y-%m-%d')} - {dates[val_mask_dates][-1].strftime('%Y-%m-%d')}")
 
-        model = xgb.XGBClassifier(**xgb_params)
-        model.fit(
-            X_train, y_train,
-            sample_weight=sw_train,
-            eval_set=[(X_val, y_val)],
-            verbose=False,
-        )
+        m_xgb = xgb.XGBClassifier(**xgb_params)
+        m_xgb.fit(X_train, y_train, sample_weight=sw_train, eval_set=[(X_val, y_val)], verbose=False)
+        p_xgb = m_xgb.predict_proba(X_val)[:, 1]
 
-        val_proba = model.predict_proba(X_val)[:, 1]
-        val_preds = (val_proba > 0.5).astype(int)
-        da = np.mean(val_preds == y_val) * 100
+        m_lgbm = lgb.LGBMClassifier(**lgbm_params)
+        m_lgbm.fit(X_train, y_train, sample_weight=sw_train, eval_set=[(X_val, y_val)], callbacks=[lgb.log_evaluation(0)])
+        p_lgbm = m_lgbm.predict_proba(X_val)[:, 1]
 
-        high_conf = (val_proba > 0.6) | (val_proba < 0.4)
+        m_cb = CatBoostClassifier(**cb_params)
+        m_cb.fit(X_train, y_train, sample_weight=sw_train, eval_set=(X_val, y_val), verbose=0)
+        p_cb = m_cb.predict_proba(X_val)[:, 1]
+
+        p_ens = (p_xgb + p_lgbm + p_cb) / 3.0
+
+        for name, p in [("XGB", p_xgb), ("LGBM", p_lgbm), ("CB", p_cb)]:
+            da = np.mean((p > 0.5).astype(int) == y_val) * 100
+            print(f"  {name}: DA={da:.1f}% mean_P={p.mean():.3f} std_P={p.std():.4f}")
+
+        ens_preds = (p_ens > 0.5).astype(int)
+        ens_da = np.mean(ens_preds == y_val) * 100
+
+        high_conf = (p_ens > 0.6) | (p_ens < 0.4)
         if high_conf.sum() > 0:
-            da_hc = np.mean(val_preds[high_conf] == y_val[high_conf]) * 100
-            pct_hc = high_conf.sum() / len(y_val) * 100
+            da_hc = np.mean(ens_preds[high_conf] == y_val[high_conf]) * 100
         else:
             da_hc = 0
-            pct_hc = 0
 
-        prob_std = np.std(val_proba)
-        prob_mean = np.mean(val_proba)
+        print(f"  ENSEMBLE: DA={ens_da:.1f}% | DA_hi={da_hc:.1f}% | mean_P={p_ens.mean():.3f}")
 
-        print(f"  Val_DA={da:.1f}% | DA_hi={da_hc:.1f}% ({pct_hc:.0f}%) | Prob: mean={prob_mean:.3f} std={prob_std:.4f}")
-
-        fold_results.append({"fold": fold, "best_da": da})
-        if da > best_da_overall:
-            best_da_overall = da
-            best_model = model
+        fold_results.append({"fold": fold, "ens_da": ens_da})
+        if ens_da > best_ens_da:
+            best_ens_da = ens_da
+            best_xgb = m_xgb
+            best_lgbm = m_lgbm
+            best_cb = m_cb
 
         current_val_start += pd.DateOffset(months=step_months)
 
     print(f"\n{'='*65}")
-    print(f"Walk-Forward Results ({fold} folds):")
+    print(f"Walk-Forward Ensemble Results ({fold} folds):")
     for fr in fold_results:
-        print(f"  Fold {fr['fold']}: DA={fr['best_da']:.1f}%")
-    avg_da = np.mean([fr["best_da"] for fr in fold_results])
-    print(f"  Average DA: {avg_da:.1f}%")
-    print(f"  Best DA: {best_da_overall:.1f}%")
+        print(f"  Fold {fr['fold']}: Ens_DA={fr['ens_da']:.1f}%")
+    avg_da = np.mean([fr["ens_da"] for fr in fold_results])
+    print(f"  Average Ensemble DA: {avg_da:.1f}%")
+    print(f"  Best Ensemble DA: {best_ens_da:.1f}%")
 
-    if best_model is not None:
-        os.makedirs(os.path.dirname(MODEL_SAVE_PATH), exist_ok=True)
-        best_model.get_booster().save_model(MODEL_SAVE_PATH.replace(".pth", ".json"))
-        print(f"\nBest XGBoost model saved (DA={best_da_overall:.1f}%)")
+    if best_xgb is not None:
+        os.makedirs(ENSEMBLE_DIR, exist_ok=True)
 
-        importances = best_model.feature_importances_
+        best_xgb.get_booster().save_model(XGB_MODEL_PATH)
+        best_lgbm.booster_.save_model(LGBM_MODEL_PATH)
+        best_cb.save_model(CB_MODEL_PATH)
+
+        best_xgb.get_booster().save_model(MODEL_SAVE_PATH.replace(".pth", ".json"))
+
+        print(f"\nModels saved:")
+        print(f"  XGB:  {XGB_MODEL_PATH}")
+        print(f"  LGBM: {LGBM_MODEL_PATH}")
+        print(f"  CB:   {CB_MODEL_PATH}")
+
         print(f"\nFeature Importance (XGBoost gain):")
-        sorted_pairs = sorted(zip(FEATURE_COLUMNS, importances), key=lambda x: -x[1])
-        for fname, imp in sorted_pairs:
+        importances = best_xgb.feature_importances_
+        for fname, imp in sorted(zip(FEATURE_COLUMNS, importances), key=lambda x: -x[1])[:15]:
             bar = "#" * max(0, int(imp * 200))
-            marker = "+" if imp > 0 else "-"
-            print(f"  {fname:20s} {marker}{abs(imp):.4f} {bar}")
+            print(f"  {fname:20s} {imp:.4f} {bar}")
 
-    return best_model, scaler
+    return best_xgb, best_lgbm, best_cb, scaler
 
 
 if __name__ == "__main__":

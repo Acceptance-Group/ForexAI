@@ -12,6 +12,7 @@ from config import (
 )
 from data_loader import build_dataset, load_raw_prices, compute_atr, compute_adx
 from broker import init_broker, get_broker, shutdown_broker
+from ensemble import predict_direction_proba
 
 
 def _utcnow():
@@ -115,12 +116,11 @@ def build_signal():
     feats_df = feats_df.loc[common_idx]
     prices_df = prices_df.loc[common_idx]
 
-    with open(SCALER_SAVE_PATH, "rb") as f:
-        scaler = pickle.load(f)
-    dir_model = xgb.XGBClassifier()
-    dir_model.load_model(MODEL_SAVE_PATH.replace(".pth", ".json"))
-    scaled = scaler.transform(feats_df.values)
-    dir_prob = dir_model.predict_proba(scaled[-1:].reshape(1, -1))[0, 1]
+    dir_prob, dir_probs = predict_direction_proba(feats_df.values[-1:].reshape(1, -1))
+    dir_prob = float(dir_prob[0])
+    prob_xgb = float(dir_probs["xgb"][0])
+    prob_lgbm = float(dir_probs["lgbm"][0])
+    prob_cb = float(dir_probs["cb"][0])
 
     vol_model = xgb.XGBRegressor()
     vol_model.load_model(VOL_MODEL_PATH)
@@ -181,7 +181,7 @@ def build_signal():
     print(f"\n{'='*60}")
     print(f"  D1 EURUSD Signal ({_utcnow().strftime('%Y-%m-%d %H:%M')} UTC)")
     print(f"{'='*60}")
-    print(f"  P(UP)          : {dir_prob:.4f}")
+    print(f"  P(UP)          : {dir_prob:.4f} (XGB={prob_xgb:.3f} LGBM={prob_lgbm:.3f} CB={prob_cb:.3f})")
     print(f"  Predicted ATR  : {current_vol:.5f} (threshold: {vol_threshold:.5f})")
     print(f"  Vol High       : {vol_high}")
     print(f"  ADX            : {current_adx:.2f}")
