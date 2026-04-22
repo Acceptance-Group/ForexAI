@@ -1,8 +1,15 @@
 import json
 import os
+import sys
 import time
 import threading
 import datetime as _dt
+
+os.environ["PYTHONUNBUFFERED"] = "1"
+if hasattr(sys, 'stdout') and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys, 'stderr') and hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(line_buffering=True)
 import pickle
 import numpy as np
 import pandas as pd
@@ -11,11 +18,122 @@ from flask import Flask, render_template_string, jsonify, request
 
 from config import (
     DATA_CONFIG, RISK_CONFIG, MODEL_SAVE_PATH, SCALER_SAVE_PATH,
-    FEATURE_COLUMNS, BACKTEST_CONFIG,
+    FEATURE_COLUMNS, BACKTEST_CONFIG, RETRAIN_CONFIG,
 )
 from data_loader import build_dataset, load_raw_prices, compute_atr, compute_adx
 from broker import init_broker, get_broker, shutdown_broker
-from ensemble import predict_direction_proba, predict_direction_proba_all
+from ensemble import predict_direction_proba, predict_direction_proba_all, reload_models
+
+VOL_MODEL_PATH = "models/vol_model.json"
+VOL_SCALER_PATH = "models/vol_scaler.pkl"
+MEANREV_MODEL_PATH = "models/meanrev_model.json"
+MEANREV_SCALER_PATH = "models/meanrev_scaler.pkl"
+SYMBOL = "EURUSD"
+TRADE_LOG = "trade_log.json"
+SIGNAL_LOG = "signal_log.json"
+
+MODEL_FILES = [
+    os.path.join("models", "dir_xgb.json"),
+    os.path.join("models", "dir_lgbm.txt"),
+    os.path.join("models", "dir_cb.cbm"),
+    VOL_MODEL_PATH,
+    MEANREV_MODEL_PATH,
+]
+
+
+def get_model_age_days():
+    newest = 0
+    for f in MODEL_FILES:
+        if os.path.exists(f):
+            newest = max(newest, os.path.getmtime(f))
+    if newest == 0:
+        return 999
+    return (time.time() - newest) / 86400
+
+
+def auto_retrain_if_needed():
+    if not RETRAIN_CONFIG.get("auto_retrain", True):
+        return False
+    max_age = RETRAIN_CONFIG.get("max_model_age_days", 7)
+    age = get_model_age_days()
+    if age > max_age:
+        print(f"\n{'='*60}", flush=True)
+        print(f"  MODEL AGE: {age:.1f} days (max: {max_age})", flush=True)
+        print(f"  Auto-retraining...", flush=True)
+        print(f"{'='*60}", flush=True)
+        import subprocess
+        print("  Running trainer_xgb.py...", flush=True)
+        result = subprocess.run(
+            [".venv/bin/python", "trainer_xgb.py"],
+            cwd=os.path.dirname(os.path.abspath(__file__)) or ".",
+            capture_output=True, text=True, env={**os.environ, "USE_ALL_DATA": "1"},
+        )
+        if result.stdout:
+            for line in result.stdout.strip().split("\n")[-20:]:
+                print(f"  {line}")
+        if result.returncode != 0:
+            print(f"  Retrain FAILED: {result.stderr[-500:]}")
+            return False
+        print("  Running trainer_multi.py...", flush=True)
+        result2 = subprocess.run(
+            [".venv/bin/python", "trainer_multi.py"],
+            cwd=os.path.dirname(os.path.abspath(__file__)) or ".",
+            capture_output=True, text=True, env={**os.environ, "USE_ALL_DATA": "1"},
+        )
+        if result2.stdout:
+            for line in result2.stdout.strip().split("\n")[-20:]:
+                print(f"  {line}")
+        if result2.returncode != 0:
+            print(f"  Multi-model retrain FAILED: {result2.stderr[-500:]}")
+            return False
+        print(f"  Retrain complete. New model age: {get_model_age_days():.1f} days", flush=True)
+        reload_models()
+        print("  Models reloaded in memory.", flush=True)
+        return True
+    return False
+
+
+def _startup_cleanup():
+    print("=" * 60, flush=True)
+    print("  STARTUP CLEANUP", flush=True)
+    print("=" * 60, flush=True)
+
+    cache_files = [
+        DATA_CONFIG.get("parquet_path", "data/eurusd_d1_features.parquet"),
+        "data/eurusd_d1_features_labels.parquet",
+        DATA_CONFIG.get("raw_parquet_path", "data/eurusd_d1_raw.parquet"),
+    ]
+    deleted = 0
+    for f in cache_files:
+        if not f or not os.path.exists(f):
+            continue
+        try:
+            import pandas as _pd
+            _pd.read_parquet(f)
+        except Exception as e:
+            print(f"  CORRUPTED: {f} — removing", flush=True)
+            try:
+                os.remove(f)
+                deleted += 1
+            except Exception:
+                pass
+
+    if deleted > 0:
+        print(f"  Cleaned {deleted} corrupted cache files", flush=True)
+    else:
+        print("  Cache OK", flush=True)
+    print("=" * 60, flush=True)
+
+    model_ok = True
+    for f in MODEL_FILES:
+        if not os.path.exists(f):
+            print(f"  MISSING MODEL: {f}", flush=True)
+            model_ok = False
+
+    if not model_ok:
+        print("  Models missing! Will retrain...", flush=True)
+        return True
+    return False
 
 
 def _utcnow():
@@ -25,13 +143,7 @@ def _utcnow():
 def _utciso():
     return _utcnow().isoformat()
 
-VOL_MODEL_PATH = "models/vol_model.json"
-VOL_SCALER_PATH = "models/vol_scaler.pkl"
-MEANREV_MODEL_PATH = "models/meanrev_model.json"
-MEANREV_SCALER_PATH = "models/meanrev_scaler.pkl"
-SYMBOL = "EURUSD"
-TRADE_LOG = "trade_log.json"
-SIGNAL_LOG = "signal_log.json"
+_threshold_cache = {}
 
 app = Flask(__name__)
 
@@ -293,7 +405,7 @@ def compute_signal(force_refresh=False):
         dyn_tp_sl = min(dyn_tp_sl, 4.0)
         tp_pips = sl_pips * dyn_tp_sl
 
-        adx_ok = current_adx >= min_adx
+        adx_ok = current_adx >= min_adx * 100
         breakeven_pips = DATA_CONFIG.get("breakeven_pips", 15)
         trail_pips = DATA_CONFIG.get("trail_pips", 10)
 
@@ -307,7 +419,7 @@ def compute_signal(force_refresh=False):
         reasons = []
         if not adx_ok:
             signal = "HOLD"
-            reasons.append(f"ADX {current_adx:.2f} < {min_adx}")
+            reasons.append(f"ADX {current_adx:.2f} < {min_adx * 100:.0f}")
         if signal != "HOLD" and not vol_high:
             signal = "HOLD"
             reasons.append(f"Vol {current_vol:.5f} <= pct20 {vol_threshold:.5f}")
@@ -350,7 +462,6 @@ def get_chart_analysis(n_bars=200):
     now = time.time()
     if _cached_analysis is not None and (now - _cached_analysis_ts) < 300:
         return _cached_analysis
-
     try:
         feats_df = build_dataset(force_download=False)
         prices_df = load_raw_prices()
@@ -386,11 +497,11 @@ def get_chart_analysis(n_bars=200):
             ax = float(adx_series.iloc[i])
             atr = float(atr_series.iloc[i])
 
-            if p > no_trade_buy and ax >= min_adx and vh:
+            if p > no_trade_buy and ax >= min_adx * 100 and vh:
                 sig = "BUY"
-            elif p < no_trade_sell and ax >= min_adx and vh:
+            elif p < no_trade_sell and ax >= min_adx * 100 and vh:
                 sig = "SELL"
-            elif ax < min_adx:
+            elif ax < min_adx * 100:
                 sig = "HOLD_ADX"
             elif not vh:
                 sig = "HOLD_VOL"
@@ -692,16 +803,26 @@ function initCharts(){
   probThresh45=probChart.addLineSeries({color:'rgba(244,114,182,0.5)',lineWidth:1,lineStyle:2,lineVisible:true});
 }
 
+let lastCandleTime=null;
 function renderCandles(candles){
   if(!candleSeries||!candles||!candles.length)return;
-  candleSeries.setData(candles.map(c=>({time:c.date,open:c.open,high:c.high,low:c.low,close:c.close})));
-  volSeries.setData(candles.map(c=>({time:c.date,value:c.volume,color:c.close>=c.open?'rgba(45,212,191,0.3)':'rgba(244,114,182,0.3)'})));
+  const newCandles=candles.map(c=>({time:c.date,open:c.open,high:c.high,low:c.low,close:c.close}));
+  const newVol=candles.map(c=>({time:c.date,value:c.volume,color:c.close>=c.open?'rgba(45,212,191,0.3)':'rgba(244,114,182,0.3)'}));
+  
+  // Если время последней свечи изменилось — обновляем
+  const lastTime=candles[candles.length-1].date;
+  if(lastTime!==lastCandleTime){
+    candleSeries.setData(newCandles);
+    volSeries.setData(newVol);
+    lastCandleTime=lastTime;
+    priceChart.timeScale().scrollToRealTime();
+  }
+  
   const l=candles[candles.length-1];
   document.getElementById('oh_o').textContent=l.open.toFixed(5);
   document.getElementById('oh_h').textContent=l.high.toFixed(5);
   document.getElementById('oh_l').textContent=l.low.toFixed(5);
   document.getElementById('oh_c').textContent=l.close.toFixed(5);
-  priceChart.timeScale().fitContent();
 }
 
 function renderAnalysis(analysis){
@@ -783,14 +904,14 @@ function updateUI(data){
 
     const fa=document.getElementById('f-adx');
     fa.textContent=(sig.adx||0).toFixed(2);
-    fa.className='text-lg font-bold font-mono '+((sig.adx||0)>=0.3?'text-emerald-400':'text-amber-400');
+    fa.className='text-lg font-bold font-mono '+((sig.adx||0)>=30?'text-emerald-400':'text-amber-400');
 
     document.getElementById('f-atr').textContent=(sig.atr_pips||0).toFixed(1)+'p';
     document.getElementById('f-sltp').textContent=(sig.sl_pips||0).toFixed(0)+'/'+(sig.tp_pips||0).toFixed(0)+'p';
 
     let frHTML='';
-    const adxOk=(sig.adx||0)>=0.3;
-    frHTML+='<div class="flex items-center gap-2"><span class="w-4 h-4 rounded flex items-center justify-center text-[10px] '+(adxOk?'bg-emerald-500/20 text-emerald-400':'bg-rose-500/20 text-rose-400')+'">'+(adxOk?'✓':'✗')+'</span><span>ADX '+(sig.adx||0).toFixed(2)+(adxOk?' ≥ 0.30':' < 0.30')+'</span></div>';
+const adxOk=(sig.adx||0)>=30;
+            frHTML+='<div class="flex items-center gap-2"><span class="w-4 h-4 rounded flex items-center justify-center text-[10px] '+(adxOk?'bg-emerald-500/20 text-emerald-400':'bg-rose-500/20 text-rose-400')+'">'+(adxOk?'✓':'✗')+'</span><span>ADX '+(sig.adx||0).toFixed(2)+(adxOk?' ≥ 30':' < 30')+'</span></div>';
     var vThresh=sig.vol_pct20?(sig.vol_pct20*10000).toFixed(1)+'p':'--';
     frHTML+='<div class="flex items-center gap-2"><span class="w-4 h-4 rounded flex items-center justify-center text-[10px] '+(sig.vol_high?'bg-emerald-500/20 text-emerald-400':'bg-rose-500/20 text-rose-400')+'">'+(sig.vol_high?'✓':'✗')+'</span><span>Vol '+(sig.vol_high?'>':'≤')+' pct20 '+vThresh+'</span></div>';
     if(sig.reasons&&sig.reasons.length){
@@ -944,6 +1065,7 @@ def api_status():
         "candles": candles,
         "markers": markers,
         "analysis": analysis,
+        "model_age_days": get_model_age_days(),
     })
 
 @app.route("/api/analysis")
@@ -1058,10 +1180,11 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
 
     bot_status["running"] = True
     last_trade_date = None
+    _last_retrain_date = None
 
     def bot_loop():
-        nonlocal last_trade_date
-        global _active_order_info
+        nonlocal last_trade_date, _last_retrain_date
+        global _active_order_info, _cached_signal, _cached_signal_ts, _cached_analysis, _cached_analysis_ts
         while True:
             try:
                 now = _utcnow()
@@ -1117,6 +1240,21 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
                         bot_status["errors"] = bot_status.get("errors", []) + [str(e)]
                         print(f"  Bot trade error: {e}")
 
+                retrain_hour = RETRAIN_CONFIG.get("retrain_hour_utc", 23)
+                if now.hour == retrain_hour and _last_retrain_date != today:
+                    print(f"\n--- Scheduled retrain at {now.strftime('%Y-%m-%d %H:%M')} UTC ---")
+                    try:
+                        did_retrain = auto_retrain_if_needed()
+                        if did_retrain:
+                            _cached_signal = None
+                            _cached_signal_ts = 0
+                            _cached_analysis = None
+                            _cached_analysis_ts = 0
+                            print("  Signal/analysis caches invalidated.")
+                        _last_retrain_date = today
+                    except Exception as e:
+                        print(f"  Scheduled retrain error: {e}")
+
                 time.sleep(60)
             except Exception as e:
                 bot_status["errors"] = bot_status.get("errors", []) + [str(e)]
@@ -1169,6 +1307,18 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
             except Exception as e:
                 print(f"  Trailing loop error: {e}")
 
+    def startup_init():
+        try:
+            need_retrain = _startup_cleanup()
+            if need_retrain:
+                print("  Starting auto-retrain...", flush=True)
+                auto_retrain_if_needed()
+            print("  Startup init complete.", flush=True)
+        except Exception as e:
+            import traceback
+            print(f"  Startup init error: {e}", flush=True)
+            traceback.print_exc()
+
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.start()
 
@@ -1177,6 +1327,9 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
 
     trailing_thread = threading.Thread(target=trailing_loop, daemon=True)
     trailing_thread.start()
+
+    init_thread = threading.Thread(target=startup_init, daemon=True)
+    init_thread.start()
 
     app.run(host=host, port=port, debug=False, use_reloader=False)
 
@@ -1218,6 +1371,14 @@ if __name__ == "__main__":
         
         threading.Thread(target=_broker_keepalive, daemon=True).start()
         load_logs()
+
+        def _dash_init():
+            try:
+                _startup_cleanup()
+            except Exception as e:
+                log.error(f"Startup cleanup error: {e}")
+
+        threading.Thread(target=_dash_init, daemon=True).start()
         bot_status["running"] = False
         log.info(f"Dashboard running on http://0.0.0.0:5000")
         app.run(host="0.0.0.0", port=5000, debug=False)

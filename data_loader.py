@@ -1,6 +1,8 @@
 import io
 import os
 import logging
+import threading
+import time
 
 import numpy as np
 import pandas as pd
@@ -18,6 +20,15 @@ from config import (
 BARS_LIMIT = 20000
 
 _broker_instance = None
+
+_dataset_lock = threading.RLock()
+_dataset_cache = None
+_dataset_cache_ts = 0
+_DATASET_CACHE_TTL = 300
+
+_raw_prices_cache = None
+_raw_prices_cache_ts = 0
+_RAW_PRICES_CACHE_TTL = 300
 
 
 def _get_broker():
@@ -252,8 +263,10 @@ def fetch_intraday_features(symbol=None) -> dict:
             start_date = DATA_CONFIG["start_date"]
             if isinstance(start_date, str):
                 start_date = pd.Timestamp(start_date)
-            end_date = DATA_CONFIG.get("end_date", "2026-04-15")
-            if isinstance(end_date, str):
+            end_date = DATA_CONFIG.get("end_date")
+            if end_date is None:
+                end_date = pd.Timestamp.now()
+            elif isinstance(end_date, str):
                 end_date = pd.Timestamp(end_date) + pd.Timedelta(days=1)
 
             bars_limit = 50000
@@ -416,6 +429,19 @@ def apply_triple_barrier_d1(close, tp=0.010, sl=0.005, max_bars=20):
 
 
 def build_dataset(force_download: bool = False) -> pd.DataFrame:
+    global _dataset_cache, _dataset_cache_ts
+    with _dataset_lock:
+        now = time.time()
+        if not force_download and _dataset_cache is not None and (now - _dataset_cache_ts) < _DATASET_CACHE_TTL:
+            return _dataset_cache
+
+        result = _build_dataset_inner(force_download)
+        _dataset_cache = result
+        _dataset_cache_ts = time.time()
+        return result
+
+
+def _build_dataset_inner(force_download: bool = False) -> pd.DataFrame:
     parquet_path = DATA_CONFIG["parquet_path"]
     raw_path = DATA_CONFIG["raw_parquet_path"]
 
@@ -486,7 +512,40 @@ def load_labels() -> pd.DataFrame:
 
 
 def load_raw_prices() -> pd.DataFrame:
+    global _raw_prices_cache, _raw_prices_cache_ts
     raw_path = DATA_CONFIG["raw_parquet_path"]
-    if not os.path.exists(raw_path):
-        build_dataset()
-    return pd.read_parquet(raw_path)
+
+    with _dataset_lock:
+        now = time.time()
+        if _raw_prices_cache is not None and (now - _raw_prices_cache_ts) < _RAW_PRICES_CACHE_TTL:
+            return _raw_prices_cache
+
+        if not os.path.exists(raw_path):
+            build_dataset(force_download=True)
+
+        try:
+            df = pd.read_parquet(raw_path)
+        except Exception as e:
+            print(f"Corrupted raw parquet, rebuilding: {e}")
+            os.remove(raw_path)
+            build_dataset(force_download=True)
+            df = pd.read_parquet(raw_path)
+
+        if not df.empty:
+            last_bar = df.index[-1]
+            now_ts = pd.Timestamp.now()
+            if hasattr(last_bar, 'tz') and last_bar.tz is not None:
+                now_ts = now_ts.tz_localize(last_bar.tz)
+            hours_old = (now_ts - last_bar).total_seconds() / 3600
+            if hours_old > 6:
+                print(f"Raw prices stale ({hours_old:.1f}h old), refetching from broker...")
+                build_dataset(force_download=True)
+                try:
+                    df = pd.read_parquet(raw_path)
+                except Exception:
+                    build_dataset(force_download=True)
+                    df = pd.read_parquet(raw_path)
+
+        _raw_prices_cache = df
+        _raw_prices_cache_ts = time.time()
+        return df

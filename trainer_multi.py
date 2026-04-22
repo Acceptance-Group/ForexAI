@@ -13,15 +13,28 @@ from config import (
 )
 from data_loader import build_dataset, load_raw_prices, compute_atr
 
-
 VOL_MODEL_PATH = "models/vol_model.json"
 VOL_SCALER_PATH = "models/vol_scaler.pkl"
 HMM_MODEL_PATH = "models/hmm_regime.pkl"
 MEANREV_MODEL_PATH = "models/meanrev_model.json"
 MEANREV_SCALER_PATH = "models/meanrev_scaler.pkl"
 
+CACHE_FILES = [
+    DATA_CONFIG.get("parquet_path", "data/eurusd_d1_features.parquet"),
+    "data/eurusd_d1_features_labels.parquet",
+    DATA_CONFIG.get("raw_parquet_path", "data/eurusd_d1_raw.parquet"),
+]
+
+
+def _clear_cache():
+    for f in CACHE_FILES:
+        if f and os.path.exists(f):
+            os.remove(f)
+            print(f"  Cache cleared: {f}")
+
 
 def run_volatility_training():
+    _clear_cache()
     print("=" * 65)
     print("TASK 1: Volatility Prediction (ATR Regression)")
     print("=" * 65)

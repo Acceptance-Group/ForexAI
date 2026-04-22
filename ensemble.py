@@ -17,6 +17,15 @@ _dir_cb = None
 _dir_scaler = None
 
 
+def reload_models():
+    global _dir_xgb, _dir_lgbm, _dir_cb, _dir_scaler
+    _dir_xgb = None
+    _dir_lgbm = None
+    _dir_cb = None
+    _dir_scaler = None
+    _load_ensemble()
+
+
 def _load_ensemble():
     global _dir_xgb, _dir_lgbm, _dir_cb, _dir_scaler
     if _dir_xgb is not None:

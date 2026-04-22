@@ -23,8 +23,22 @@ XGB_MODEL_PATH = os.path.join(ENSEMBLE_DIR, "dir_xgb.json")
 LGBM_MODEL_PATH = os.path.join(ENSEMBLE_DIR, "dir_lgbm.txt")
 CB_MODEL_PATH = os.path.join(ENSEMBLE_DIR, "dir_cb.cbm")
 
+CACHE_FILES = [
+    DATA_CONFIG.get("parquet_path", "data/eurusd_d1_features.parquet"),
+    "data/eurusd_d1_features_labels.parquet",
+    DATA_CONFIG.get("raw_parquet_path", "data/eurusd_d1_raw.parquet"),
+]
+
+
+def _clear_cache():
+    for f in CACHE_FILES:
+        if f and os.path.exists(f):
+            os.remove(f)
+            print(f"  Cache cleared: {f}")
+
 
 def run_training():
+    _clear_cache()
     feats_df = build_dataset(force_download=True)
     prices_df = load_raw_prices()
     labels_df = load_labels()

@@ -81,8 +81,10 @@ def run_full_backtest():
     compound = RISK_CONFIG.get("compound", False)
     min_adx = DATA_CONFIG.get("min_adx", 0.20)
 
-    mask = (feats_df.index >= BACKTEST_CONFIG["start_date"]) & \
-           (feats_df.index < BACKTEST_CONFIG["end_date"])
+    mask = feats_df.index >= BACKTEST_CONFIG["start_date"]
+    end_date = BACKTEST_CONFIG.get("end_date")
+    if end_date is not None:
+        mask = mask & (feats_df.index < end_date)
     bt_indices = np.where(mask)[0]
     bt_indices = bt_indices[bt_indices < len(prices_df) - 1]
 
@@ -346,7 +348,8 @@ def run_full_backtest():
     print("| $$   | $$  | $$| $$      | $$_____/  >$$  $$ | $$  | $$  | $$  ")
     print("| $$   |  $$$$$$/| $$      |  $$$$$$$ /$$/\\  $$| $$  | $$ /$$$$$$")
     print("|__/    \\______/ |__/       \\_______/|__/  \\__/|__/  |__/|______/")
-    print(f"  BACKTEST {BACKTEST_CONFIG['start_date']} - {BACKTEST_CONFIG['end_date']} | Strategy: XGBoost + Vol + Trail | Bars: {n_total}")
+    bt_end = BACKTEST_CONFIG.get("end_date") or "now"
+    print(f"  BACKTEST {BACKTEST_CONFIG['start_date']} - {bt_end} | Strategy: XGBoost + Vol + Trail | Bars: {n_total}")
     print(f"{'='*70}")
     print(f"  TP/SL Ratio  : {tp_sl_ratio}x (dynamic vol-scaled)")
     print(f"  No-Trade Zone: BUY >{no_trade_buy_above}, SELL <{no_trade_sell_below}")

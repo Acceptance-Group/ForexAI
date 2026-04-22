@@ -2,7 +2,7 @@ import torch
 
 DATA_CONFIG = {
     "start_date": "2010-01-01",
-    "end_date": "2026-04-14",
+    "end_date": None,
     "parquet_path": "data/eurusd_d1_features.parquet",
     "raw_parquet_path": "data/eurusd_d1_raw.parquet",
     "lookback": 10,
@@ -108,7 +108,13 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 BACKTEST_CONFIG = {
     "start_date": "2024-01-01",
-    "end_date": "2026-04-14",
+    "end_date": None,
+}
+
+RETRAIN_CONFIG = {
+    "max_model_age_days": 7,
+    "auto_retrain": True,
+    "retrain_hour_utc": 23,
 }
 
 MODEL_SAVE_PATH = "models/forex_predictor.pth"
