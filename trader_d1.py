@@ -110,8 +110,8 @@ def modify_sl(position, new_sl, symbol=SYMBOL):
 
 def build_signal():
     print("Building D1 signal (XGBoost + Vol Filter + Trailing Stop)...")
-    feats_df = build_dataset(force_download=False)
     prices_df = load_raw_prices()
+    feats_df = build_dataset(force_download=True)
     common_idx = feats_df.index.intersection(prices_df.index)
     feats_df = feats_df.loc[common_idx]
     prices_df = prices_df.loc[common_idx]

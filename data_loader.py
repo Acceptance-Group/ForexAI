@@ -537,7 +537,8 @@ def load_raw_prices() -> pd.DataFrame:
             if hasattr(last_bar, 'tz') and last_bar.tz is not None:
                 now_ts = now_ts.tz_localize(last_bar.tz)
             hours_old = (now_ts - last_bar).total_seconds() / 3600
-            if hours_old > 6:
+            stale_threshold = 26 if DATA_CONFIG.get("timeframe") == "1d" else 6
+            if hours_old > stale_threshold:
                 print(f"Raw prices stale ({hours_old:.1f}h old), refetching from broker...")
                 build_dataset(force_download=True)
                 try:

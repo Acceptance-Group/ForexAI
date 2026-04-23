@@ -216,6 +216,10 @@ def _broker_keepalive():
                                 "time": p.time.isoformat() if p.time and isinstance(p.time, _dt.datetime) else "",
                             })
                     tick = broker.symbol_info_tick(SYMBOL)
+                    prev_bid = _cached_account.get("bid", 0) if _cached_account else 0
+                    prev_ask = _cached_account.get("ask", 0) if _cached_account else 0
+                    new_bid = round(tick.bid, 5) if tick and tick.bid > 0 else prev_bid
+                    new_ask = round(tick.ask, 5) if tick and tick.ask > 0 else prev_ask
                     result = {
                         "balance": info.balance,
                         "equity": info.equity,
@@ -225,9 +229,9 @@ def _broker_keepalive():
                         "leverage": info.leverage,
                         "server": info.server,
                         "positions": pos_list,
-                        "bid": round(tick.bid, 5) if tick and tick.bid > 0 else 0,
-                        "ask": round(tick.ask, 5) if tick and tick.ask > 0 else 0,
-                        "spread": round((tick.ask - tick.bid) * 100000, 1) if tick and tick.ask > 0 and tick.bid > 0 and tick.ask > tick.bid else 0,
+                        "bid": new_bid,
+                        "ask": new_ask,
+                        "spread": round((new_ask - new_bid) * 100000, 1) if new_ask > 0 and new_bid > 0 and new_ask > new_bid else 0,
                         "connected": True,
                     }
                     _cached_account = result
@@ -346,7 +350,7 @@ def save_signal(sig):
 
 _cached_signal = None
 _cached_signal_ts = 0
-SIGNAL_CACHE_SEC = 60
+SIGNAL_CACHE_SEC = 10
 
 
 def compute_signal(force_refresh=False):
@@ -354,8 +358,8 @@ def compute_signal(force_refresh=False):
     if not force_refresh and _cached_signal is not None and (time.time() - _cached_signal_ts) < SIGNAL_CACHE_SEC:
         return _cached_signal
     try:
-        feats_df = build_dataset(force_download=force_refresh)
         prices_df = load_raw_prices()
+        feats_df = build_dataset(force_download=force_refresh)
         common_idx = feats_df.index.intersection(prices_df.index)
         feats_df = feats_df.loc[common_idx]
         prices_df = prices_df.loc[common_idx]
@@ -419,11 +423,9 @@ def compute_signal(force_refresh=False):
         reasons = []
         if not adx_ok:
             signal = "HOLD"
-            reasons.append(f"ADX {current_adx:.2f} < {min_adx * 100:.0f}")
         if signal != "HOLD" and not vol_high:
             signal = "HOLD"
-            reasons.append(f"Vol {current_vol:.5f} <= pct20 {vol_threshold:.5f}")
-        if signal == "HOLD" and not reasons:
+        if signal == "HOLD":
             reasons.append(f"P(UP)={dir_prob:.3f} in [{no_trade_sell_below}, {no_trade_buy_above}]")
 
         sig = {
@@ -463,8 +465,8 @@ def get_chart_analysis(n_bars=200):
     if _cached_analysis is not None and (now - _cached_analysis_ts) < 300:
         return _cached_analysis
     try:
-        feats_df = build_dataset(force_download=False)
         prices_df = load_raw_prices()
+        feats_df = build_dataset(force_download=False)
         common_idx = feats_df.index.intersection(prices_df.index)
         feats_df = feats_df.loc[common_idx]
         prices_df = prices_df.loc[common_idx]
@@ -859,7 +861,7 @@ function updateUI(data){
 
   const lp=document.getElementById('live-price');
   const pc=document.getElementById('price-chg');
-  if(conn&&brk.bid){
+  if(conn&&brk.bid>0){
     lp.textContent=brk.bid.toFixed(5);
     if(data.candles&&data.candles.length>1){
       const prev=data.candles[data.candles.length-2].close;

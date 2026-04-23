@@ -525,7 +525,7 @@ class CTraderClient:
 
                 ev = threading.Event()
                 self._events["ProtoOASpotEvent"] = ev
-                ev.wait(timeout=3)
+                ev.wait(timeout=5)
                 data = self._responses.get("ProtoOASpotEvent")
                 if data and getattr(data, 'symbolId', 0) == sym_id:
                     tick = _TickInfo()
@@ -537,7 +537,6 @@ class CTraderClient:
                     self._last_spots[sym_id] = (tick.bid, tick.ask, time.time(), tick.time)
                     return tick
 
-                cached = self._last_spots.get(sym_id)
                 if cached:
                     tick = _TickInfo()
                     tick.bid = cached[0]
