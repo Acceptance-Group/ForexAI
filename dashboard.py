@@ -808,8 +808,10 @@ function initCharts(){
 let lastCandleTime=null;
 function renderCandles(candles){
   if(!candleSeries||!candles||!candles.length)return;
+  // Validate candle structure
+  if(!candles[0].date || candles[0].open === undefined)return;
   const newCandles=candles.map(c=>({time:c.date,open:c.open,high:c.high,low:c.low,close:c.close}));
-  const newVol=candles.map(c=>({time:c.date,value:c.volume,color:c.close>=c.open?'rgba(45,212,191,0.3)':'rgba(244,114,182,0.3)'}));
+  const newVol=candles.map(c=>({time:c.date,value:c.volume||0,color:c.close>=c.open?'rgba(45,212,191,0.3)':'rgba(244,114,182,0.3)'}));
   
   // Если время последней свечи изменилось — обновляем
   const lastTime=candles[candles.length-1].date;
@@ -985,10 +987,10 @@ async function fetchStatus(){
     const r=await fetch('/api/status');
     if(!r.ok) throw new Error('HTTP '+r.status);
     const data=await r.json();
-    if(data.candles&&data.candles.length>0){
-      if(!candleSeries)initCharts();
-      renderCandles(data.candles);
-      renderAnalysis(data.analysis||[]);
+    // Only render candles if we have valid data with proper structure
+    if(data.candles && data.candles.length > 0 && data.candles[0].date){
+      if(!candleSeries) initCharts();
+      if(candleSeries) renderCandles(data.candles);
     }
     updateUI(data);
   }catch(e){
@@ -998,13 +1000,28 @@ async function fetchStatus(){
   }
 }
 
+async function fetchAnalysis(){
+  try{
+    const r=await fetch('/api/analysis');
+    if(!r.ok) return;
+    const analysis=await r.json();
+    if(analysis&&analysis.length>0){
+      if(!candleSeries)initCharts();
+      renderAnalysis(analysis);
+    }
+  }catch(e){
+    console.error('fetchAnalysis error:',e);
+  }
+}
+
 window.addEventListener('resize',()=>{
   if(priceChart)priceChart.applyOptions({width:document.getElementById('priceChart').clientWidth});
   if(probChart)probChart.applyOptions({width:document.getElementById('probChart').clientWidth});
 });
 
-setInterval(fetchStatus,10000);
+setInterval(()=>{fetchStatus();fetchAnalysis();},10000);
 fetchStatus();
+fetchAnalysis();
 </script>
 </body>
 </html>
@@ -1013,6 +1030,34 @@ fetchStatus();
 @app.route("/")
 def dashboard():
     return render_template_string(HTML_TEMPLATE)
+
+_cached_candles = None
+_cached_candles_ts = 0
+_CANDLES_CACHE_TTL = 300
+
+def _bg_update_candles():
+    global _cached_candles, _cached_candles_ts
+    try:
+        feats = build_dataset(force_download=False)
+        prices = load_raw_prices()
+        common_idx = feats.index.intersection(prices.index)
+        prices = prices.loc[common_idx]
+        
+        candles = []
+        for i in range(max(0, len(prices)-200), len(prices)):
+            dt = prices.index[i]
+            candles.append({
+                "date": dt.strftime("%Y-%m-%d"),
+                "open": float(prices.iloc[i]["open"]),
+                "high": float(prices.iloc[i]["high"]),
+                "low": float(prices.iloc[i]["low"]),
+                "close": float(prices.iloc[i]["close"]),
+                "volume": float(prices.iloc[i].get("tick_volume", 0)),
+            })
+        _cached_candles = candles
+        _cached_candles_ts = time.time()
+    except Exception as e:
+        print(f"BG candles error: {e}")
 
 @app.route("/api/status")
 def api_status():
@@ -1023,6 +1068,10 @@ def api_status():
     sig = _cached_signal if _cached_signal else {"signal": "PENDING", "timestamp": _utciso()}
     if not _cached_signal:
         threading.Thread(target=_bg_compute_signal, daemon=True).start()
+
+    # Update candles in background if stale
+    if _cached_candles is None or (time.time() - _cached_candles_ts) > _CANDLES_CACHE_TTL:
+        threading.Thread(target=_bg_update_candles, daemon=True).start()
 
     long_wins = sum(1 for t in trade_history if t.get("side") == "BUY" and (t.get("pnl", 0) > 0))
     long_total = sum(1 for t in trade_history if t.get("side") == "BUY")
@@ -1050,13 +1099,6 @@ def api_status():
         "short_wins": short_wins, "short_total": short_total,
     }
 
-    candles = get_candles(200) or []
-    markers = get_signal_markers()
-    try:
-        analysis = get_chart_analysis(200) or []
-    except Exception:
-        analysis = []
-
     return jsonify({
         "broker": broker_info or {},
         "signal": sig,
@@ -1064,9 +1106,9 @@ def api_status():
         "performance": perf,
         "equity_history": equity_history[-200:],
         "bot_status": bot_status,
-        "candles": candles,
-        "markers": markers,
-        "analysis": analysis,
+        "candles": _cached_candles or [],
+        "markers": get_signal_markers(),
+        "analysis": [],  # Client should fetch /api/analysis separately
         "model_age_days": get_model_age_days(),
     })
 
