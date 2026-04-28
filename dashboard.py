@@ -23,6 +23,7 @@ from config import (
 from data_loader import build_dataset, load_raw_prices, compute_atr, compute_adx
 from broker import init_broker, get_broker, shutdown_broker
 from ensemble import predict_direction_proba, predict_direction_proba_all, reload_models
+import telegram_bot
 
 VOL_MODEL_PATH = "models/vol_model.json"
 VOL_SCALER_PATH = "models/vol_scaler.pkl"
@@ -451,6 +452,7 @@ def compute_signal(force_refresh=False):
         save_signal(sig)
         _cached_signal = sig
         _cached_signal_ts = time.time()
+        telegram_bot.send_thinking_update(sig)
         return sig
     except Exception as e:
         err = {"timestamp": _utciso(), "signal": "ERROR", "error": str(e)}
@@ -1200,6 +1202,8 @@ def api_diagnose():
     })
 
 _active_order_info = None
+_position_open_time = None
+_last_known_position = None
 
 def run_bot_with_dashboard(host="0.0.0.0", port=5000):
     from trader_d1 import build_signal, get_open_position, close_position, place_order, modify_sl, get_current_price, SYMBOL, BREAKEVEN_PIPS, TRAIL_PIPS, MAX_HOLD_BARS
@@ -1228,7 +1232,7 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
 
     def bot_loop():
         nonlocal last_trade_date, _last_retrain_date
-        global _active_order_info, _cached_signal, _cached_signal_ts, _cached_analysis, _cached_analysis_ts
+        global _active_order_info, _cached_signal, _cached_signal_ts, _cached_analysis, _cached_analysis_ts, _position_open_time
         while True:
             try:
                 now = _utcnow()
@@ -1253,14 +1257,26 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
                                     print(f"  Already in {pos_type} matching {signal}. Holding.")
                                 else:
                                     print(f"  Closing {pos_type} (new signal: {signal})...")
+                                    closed_pnl = existing.profit
+                                    closed_ticket = existing.ticket
                                     close_position(existing)
                                     time.sleep(1)
+                                    telegram_bot.send_trade_close({
+                                        "side": pos_type,
+                                        "pnl": closed_pnl,
+                                        "reason": "Signal Change",
+                                        "ticket": closed_ticket,
+                                        "timestamp": now.isoformat(),
+                                        "duration_hours": ((_utcnow() - _position_open_time).total_seconds() / 3600) if _position_open_time else 0,
+                                    })
                                     existing = None
 
                             if existing is None:
                                 order_info = place_order(sig_info)
                                 if order_info:
                                     _active_order_info = order_info
+                                    _position_open_time = now
+                                    telegram_bot.send_trade_open(sig, order_info)
                                     try:
                                         broker = get_broker()
                                         info = broker.account_info()
@@ -1306,17 +1322,38 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
                 time.sleep(60)
 
     def trailing_loop():
-        global _active_order_info
+        global _active_order_info, _last_known_position
         while True:
             time.sleep(60)
             try:
                 if not _broker_connected:
                     continue
                 position = get_open_position()
+                if position is not None:
+                    _last_known_position = {
+                        "ticket": position.ticket,
+                        "profit": position.profit,
+                        "type": position.type,
+                        "sl": position.sl,
+                        "tp": position.tp,
+                    }
                 if position is None:
-                    if _active_order_info is not None:
+                    if _active_order_info is not None and _last_known_position is not None:
                         print("  Position closed (TP/SL hit)")
+                        pos_type = "BUY" if _last_known_position["type"] == 0 else "SELL"
+                        duration = 0
+                        if _position_open_time:
+                            duration = (_utcnow() - _position_open_time).total_seconds() / 3600
+                        telegram_bot.send_trade_close({
+                            "side": pos_type,
+                            "pnl": _last_known_position["profit"],
+                            "reason": "TP / SL / Trailing",
+                            "ticket": _last_known_position["ticket"],
+                            "timestamp": _utciso(),
+                            "duration_hours": duration,
+                        })
                         _active_order_info = None
+                        _last_known_position = None
                     continue
 
                 is_buy = position.type == 0
@@ -1363,6 +1400,8 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
             import traceback
             print(f"  Startup init error: {e}", flush=True)
             traceback.print_exc()
+
+    telegram_bot.init_telegram()
 
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.start()
@@ -1416,6 +1455,7 @@ if __name__ == "__main__":
         
         threading.Thread(target=_broker_keepalive, daemon=True).start()
         load_logs()
+        telegram_bot.init_telegram()
 
         def _dash_init():
             try:

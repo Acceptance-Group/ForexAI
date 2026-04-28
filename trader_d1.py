@@ -13,6 +13,7 @@ from config import (
 from data_loader import build_dataset, load_raw_prices, compute_atr, compute_adx
 from broker import init_broker, get_broker, shutdown_broker
 from ensemble import predict_direction_proba
+import telegram_bot
 
 
 def _utcnow():
@@ -296,6 +297,8 @@ def manage_trailing_stop(order_info, symbol=SYMBOL):
     print(f"  {'BUY' if is_buy else 'SELL'} @ {entry:.5f} | SL={original_sl:.5f} | BE={BREAKEVEN_PIPS}p | Trail={TRAIL_PIPS}p")
     print(f"  Max hold: {MAX_HOLD_BARS} D1 bars ({max_hold_hours}h)")
 
+    last_pnl = 0
+    close_reason = "TP / SL / Trailing"
     while True:
         position = get_open_position(symbol)
         if position is None or position.ticket != order_info["ticket"]:
@@ -306,6 +309,7 @@ def manage_trailing_stop(order_info, symbol=SYMBOL):
         ask, _ = get_current_price(symbol)
         current_price = bid if is_buy else ask
         current_pnl = position.profit
+        last_pnl = current_pnl
         elapsed = (_utcnow() - start_time).total_seconds() / 3600
 
         if is_buy:
@@ -339,17 +343,28 @@ def manage_trailing_stop(order_info, symbol=SYMBOL):
                     if modify_sl(position, new_sl, symbol):
                         print(f"  [{elapsed:.1f}h] Trail DOWN: SL={new_sl:.5f} (low={lowest:.5f})")
 
-        if elapsed >= max_hold_hours:
-            print(f"  [{elapsed:.1f}h] Max hold reached. Closing position...")
-            close_position(position)
-            break
-
         if elapsed % 4 < CHECK_INTERVAL_SEC / 3600:
             pnl_str = f"${current_pnl:+.2f}" if current_pnl else "N/A"
             be_str = "BE" if be_triggered else "--"
-            print(f"  [{elapsed:.1f}h] P&L={pnl_str} | {be_str} | High={highest:.5f if is_buy else lowest} | SL={position.sl:.5f}")
+            high_low_str = f"{highest:.5f}" if is_buy else f"{lowest:.5f}"
+            print(f"  [{elapsed:.1f}h] P&L={pnl_str} | {be_str} | High/Low={high_low_str} | SL={position.sl:.5f}")
 
         time.sleep(CHECK_INTERVAL_SEC)
+
+        if elapsed >= max_hold_hours:
+            print(f"  [{elapsed:.1f}h] Max hold reached. Closing position...")
+            close_reason = "Max Hold"
+            close_position(position)
+            break
+
+    telegram_bot.send_trade_close({
+        "side": order_info["signal"],
+        "pnl": last_pnl,
+        "reason": close_reason,
+        "ticket": order_info["ticket"],
+        "timestamp": _utcnow().isoformat(),
+        "duration_hours": (_utcnow() - start_time).total_seconds() / 3600,
+    })
 
 
 def run_trading_cycle():
@@ -373,11 +388,22 @@ def run_trading_cycle():
             print(f"  Already in {pos_type} matching {new_signal}. Holding. P&L: ${existing.profit:.2f}")
             return None
         print(f"  Closing {pos_type} (new signal: {new_signal})...")
+        closed_pnl = existing.profit
+        closed_ticket = existing.ticket
         close_position(existing)
         time.sleep(1)
+        telegram_bot.send_trade_close({
+            "side": pos_type,
+            "pnl": closed_pnl,
+            "reason": "Signal Change",
+            "ticket": closed_ticket,
+            "timestamp": _utcnow().isoformat(),
+            "duration_hours": 0,
+        })
 
     order_info = place_order(signal_info)
     if order_info:
+        telegram_bot.send_trade_open(signal_info, order_info)
         manage_trailing_stop(order_info)
     return order_info
 
@@ -405,6 +431,8 @@ def run_bot_d1():
     if not init_broker():
         print("Cannot connect to broker!")
         return
+
+    telegram_bot.init_telegram()
 
     last_trade_date = None
     try:

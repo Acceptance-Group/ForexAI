@@ -130,3 +130,7 @@ CTRADER_CONFIG = {
     "account_id": 46995819,                  
     "symbol": "EURUSD",
 }
+
+TELEGRAM_CONFIG = {
+    "bot_token": "8678847258:AAGoKMTcGYaFD0hmALdCtLYhWJHp-aMg_PY",
+}
