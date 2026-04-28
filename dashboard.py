@@ -25,6 +25,8 @@ from broker import init_broker, get_broker, shutdown_broker
 from ensemble import predict_direction_proba, predict_direction_proba_all, reload_models
 import telegram_bot
 
+telegram_bot.set_cached_signal_ref(lambda: _cached_signal)
+
 VOL_MODEL_PATH = "models/vol_model.json"
 VOL_SCALER_PATH = "models/vol_scaler.pkl"
 MEANREV_MODEL_PATH = "models/meanrev_model.json"
@@ -307,11 +309,16 @@ def ensure_broker():
 
 
 def _bg_compute_signal():
+    global _signal_computing
+    if _signal_computing:
+        return
+    _signal_computing = True
     try:
         compute_signal(force_refresh=False)
     except Exception as e:
         print(f"BG signal error: {e}")
-        return False
+    finally:
+        _signal_computing = False
 
 
 def load_logs():
@@ -351,13 +358,45 @@ def save_signal(sig):
 
 _cached_signal = None
 _cached_signal_ts = 0
-SIGNAL_CACHE_SEC = 10
+SIGNAL_CACHE_SEC = 300
+_signal_lock = threading.Lock()
+_signal_computing = False
+
+_vol_model = None
+_vol_scaler = None
+_mr_model = None
+_mr_scaler = None
+
+
+def _load_vol_mr_models():
+    global _vol_model, _vol_scaler, _mr_model, _mr_scaler
+    if _vol_model is None:
+        _vol_model = xgb.XGBRegressor()
+        _vol_model.load_model(VOL_MODEL_PATH)
+        with open(VOL_SCALER_PATH, "rb") as f:
+            _vol_scaler = pickle.load(f)
+    if _mr_model is None:
+        _mr_model = xgb.XGBClassifier()
+        _mr_model.load_model(MEANREV_MODEL_PATH)
+        with open(MEANREV_SCALER_PATH, "rb") as f:
+            _mr_scaler = pickle.load(f)
+    return _vol_model, _vol_scaler, _mr_model, _mr_scaler
 
 
 def compute_signal(force_refresh=False):
     global last_signal, _cached_signal, _cached_signal_ts
     if not force_refresh and _cached_signal is not None and (time.time() - _cached_signal_ts) < SIGNAL_CACHE_SEC:
-        return _cached_signal
+        # Don't cache errors for long — retry after 30s
+        if _cached_signal.get("signal") == "ERROR" and (time.time() - _cached_signal_ts) > 30:
+            pass  # fall through to recompute
+        else:
+            return _cached_signal
+
+    acquired = _signal_lock.acquire(blocking=False)
+    if not acquired:
+        # Another thread is computing right now — return stale cached or pending
+        return _cached_signal if _cached_signal else {"signal": "PENDING", "timestamp": _utciso()}
+
     try:
         prices_df = load_raw_prices()
         feats_df = build_dataset(force_download=force_refresh)
@@ -368,10 +407,8 @@ def compute_signal(force_refresh=False):
         dir_prob, dir_probs = predict_direction_proba(feats_df.values[-1:].reshape(1, -1))
         dir_prob = float(dir_prob[0])
 
-        vol_model = xgb.XGBRegressor()
-        vol_model.load_model(VOL_MODEL_PATH)
-        with open(VOL_SCALER_PATH, "rb") as f:
-            vol_scaler = pickle.load(f)
+        vol_model, vol_scaler, mr_model, mr_scaler = _load_vol_mr_models()
+
         vol_scaled = vol_scaler.transform(feats_df.values)
         vol_pred = vol_model.predict(vol_scaled)
         vol_pct = pd.Series(vol_pred).rolling(252, min_periods=30).quantile(0.20).values
@@ -379,10 +416,6 @@ def compute_signal(force_refresh=False):
         current_vol = vol_pred[-1]
         vol_high = current_vol > vol_threshold
 
-        mr_model = xgb.XGBClassifier()
-        mr_model.load_model(MEANREV_MODEL_PATH)
-        with open(MEANREV_SCALER_PATH, "rb") as f:
-            mr_scaler = pickle.load(f)
         mr_scaled = mr_scaler.transform(feats_df.values)
         mr_prob = mr_model.predict_proba(mr_scaled[-1:].reshape(1, -1))[0, 1]
 
@@ -459,6 +492,8 @@ def compute_signal(force_refresh=False):
         _cached_signal = err
         _cached_signal_ts = time.time()
         return err
+    finally:
+        _signal_lock.release()
 
 
 def get_chart_analysis(n_bars=200):
@@ -475,10 +510,7 @@ def get_chart_analysis(n_bars=200):
 
         prob_up_all, _ = predict_direction_proba_all(feats_df.values)
 
-        vol_model = xgb.XGBRegressor()
-        vol_model.load_model(VOL_MODEL_PATH)
-        with open(VOL_SCALER_PATH, "rb") as f:
-            vol_scaler = pickle.load(f)
+        vol_model, vol_scaler, _, _ = _load_vol_mr_models()
         vol_scaled = vol_scaler.transform(feats_df.values)
         vol_pred_all = vol_model.predict(vol_scaled)
         vol_pct = pd.Series(vol_pred_all).rolling(252, min_periods=30).quantile(0.20).values
@@ -1068,7 +1100,7 @@ def api_status():
     except Exception:
         broker_info = {"connected": False}
     sig = _cached_signal if _cached_signal else {"signal": "PENDING", "timestamp": _utciso()}
-    if not _cached_signal:
+    if not _cached_signal or _cached_signal.get("signal") == "ERROR":
         threading.Thread(target=_bg_compute_signal, daemon=True).start()
 
     # Update candles in background if stale
@@ -1238,6 +1270,8 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
                 now = _utcnow()
                 today = now.strftime("%Y-%m-%d")
                 bot_status["last_check"] = now.isoformat()
+                if _cached_signal and _cached_signal.get("signal") != "ERROR":
+                    bot_status["last_signal_time"] = _cached_signal.get("timestamp", "")
 
                 if now.hour == 0 and now.minute < 10 and today != last_trade_date:
                     print(f"\n--- D1 bar close {now.strftime('%Y-%m-%d %H:%M')} UTC ---")
@@ -1415,7 +1449,7 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
     init_thread = threading.Thread(target=startup_init, daemon=True)
     init_thread.start()
 
-    app.run(host=host, port=port, debug=False, use_reloader=False)
+    app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
 
 
 if __name__ == "__main__":
@@ -1466,7 +1500,7 @@ if __name__ == "__main__":
         threading.Thread(target=_dash_init, daemon=True).start()
         bot_status["running"] = False
         log.info(f"Dashboard running on http://0.0.0.0:5000")
-        app.run(host="0.0.0.0", port=5000, debug=False)
+        app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
     else:
         port = int(cmd) if cmd.isdigit() else 5000
         load_logs()

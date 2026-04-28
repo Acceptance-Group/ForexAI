@@ -17,7 +17,11 @@ _polling_thread = None
 _last_signal_hash = None
 _last_signal_text = None
 
+# Reference to dashboard's cached signal (injected from dashboard.py)
+_cached_signal_ref = None
+
 _CHATS_FILE = "telegram_chats.json"
+_rate_limit_until = 0
 
 
 def _load_chats():
@@ -48,6 +52,11 @@ def _add_chat(chat_id):
             log.info(f"Telegram: new chat added {chat_id}")
 
 
+def set_cached_signal_ref(ref):
+    global _cached_signal_ref
+    _cached_signal_ref = ref
+
+
 def init_telegram():
     global _bot_token
     _bot_token = TELEGRAM_CONFIG.get("bot_token", "")
@@ -62,76 +71,89 @@ def init_telegram():
 
 
 def _polling_loop():
-    global _known_chats
-    offset = 0
+    # Start with offset=-1 to skip old updates on restart
+    offset = -1
+    first_request = True
     while True:
         try:
             if not _bot_token:
                 time.sleep(10)
                 continue
             url = f"https://api.telegram.org/bot{_bot_token}/getUpdates"
-            resp = requests.get(url, params={"offset": offset, "limit": 100}, timeout=30)
+            params = {"limit": 100, "timeout": 5}
+            if offset >= 0:
+                params["offset"] = offset
+            resp = requests.get(url, params=params, timeout=15)
             data = resp.json()
             if not data.get("ok"):
-                time.sleep(5)
+                err_desc = data.get("description", "")
+                if "Retry after" in err_desc or "retry after" in err_desc:
+                    log.warning(f"Telegram rate limited: {err_desc}")
+                    time.sleep(10)
+                else:
+                    log.warning(f"Telegram getUpdates error: {data}")
+                    time.sleep(5)
                 continue
-            for update in data.get("result", []):
+            updates = data.get("result", [])
+            if first_request and offset == -1 and not updates:
+                # After offset=-1, switch to normal offset=0 for new updates
+                offset = 0
+                first_request = False
+                continue
+            first_request = False
+            for update in updates:
                 offset = update["update_id"] + 1
-                _process_update(update)
+                # Process each update in a background thread so polling never blocks
+                threading.Thread(target=_process_update, args=(update,), daemon=True).start()
         except Exception as e:
             log.error(f"Telegram polling error: {e}")
             time.sleep(5)
 
 
 def _process_update(update):
-    # Handle regular messages (incl. group messages where bot is mentioned or /command)
-    msg = update.get("message")
-    if msg:
-        chat_id = msg["chat"]["id"]
-        _add_chat(chat_id)
+    try:
+        # Handle regular messages
+        msg = update.get("message")
+        if msg:
+            chat_id = msg["chat"]["id"]
+            _add_chat(chat_id)
 
-        # Handle bot added to group via new_chat_members
-        new_members = msg.get("new_chat_members", [])
-        for m in new_members:
-            if m.get("is_bot") and m.get("username"):
+            # Handle bot added to group via new_chat_members
+            new_members = msg.get("new_chat_members", [])
+            for m in new_members:
+                if m.get("is_bot") and m.get("username"):
+                    _add_chat(chat_id)
+                    log.info(f"Bot added to group {chat_id}")
+
+            text = msg.get("text", "")
+            if text and text.startswith("/"):
+                _handle_command(chat_id, text, msg)
+            return
+
+        # Handle my_chat_member (bot added to group / DM started)
+        my_chat = update.get("my_chat_member")
+        if my_chat:
+            chat = my_chat["chat"]
+            chat_id = chat["id"]
+            new_status = my_chat.get("new_chat_member", {}).get("status", "")
+            if new_status in ("member", "administrator"):
                 _add_chat(chat_id)
-                log.info(f"Bot added to group {chat_id}")
+                log.info(f"Bot became member of chat {chat_id} ({chat.get('type', '?')})")
+                if chat.get("type") == "private":
+                    _send_message(chat_id,
+                        "🤖 *ForexAI* бот активирован!\n\n"
+                        "Я буду присылать обновления сигналов и уведомления о сделках.",
+                        parse_mode="Markdown"
+                    )
+            return
 
-        text = msg.get("text", "")
-        if text and text.startswith("/"):
-            _handle_command(chat_id, text, msg)
-        return
-
-    # Handle my_chat_member (bot added to group / DM started)
-    my_chat = update.get("my_chat_member")
-    if my_chat:
-        chat = my_chat["chat"]
-        chat_id = chat["id"]
-        new_status = my_chat.get("new_chat_member", {}).get("status", "")
-        if new_status in ("member", "administrator"):
+        # Handle callback_query
+        cb = update.get("callback_query")
+        if cb:
+            chat_id = cb["message"]["chat"]["id"]
             _add_chat(chat_id)
-            log.info(f"Bot became member of chat {chat_id} ({chat.get('type', '?')})")
-            if chat.get("type") == "private":
-                _send_message(chat_id,
-                    "🤖 *ForexAI* бот активирован!\n\n"
-                    "Я буду присылать обновления сигналов и уведомления о сделках.",
-                    parse_mode="Markdown"
-                )
-        return
-
-    # Handle chat_member updates (if allowed)
-    chat_mem = update.get("chat_member")
-    if chat_mem:
-        chat_id = chat_mem["chat"]["id"]
-        new_status = chat_mem.get("new_chat_member", {}).get("status", "")
-        if new_status in ("member", "administrator"):
-            _add_chat(chat_id)
-
-    # Handle callback_query (buttons)
-    cb = update.get("callback_query")
-    if cb:
-        chat_id = cb["message"]["chat"]["id"]
-        _add_chat(chat_id)
+    except Exception as e:
+        log.error(f"Process update error: {e}")
 
 
 def _handle_command(chat_id, text, msg):
@@ -143,14 +165,14 @@ def _handle_command(chat_id, text, msg):
             "*Команды:*\n"
             "`/status` — текущий статус\n"
             "`/signal` — текущий сигнал\n"
-            "`/chats` — список активных чатов\n"
+            "`/chats` — активных чатов\n"
             "`/help` — справка",
             parse_mode="Markdown"
         )
     elif text == "/status":
-        _send_message(chat_id, "📊 Статус запрошен... (скоро будет)")
+        _send_status(chat_id)
     elif text == "/signal":
-        _send_message(chat_id, "📡 Сигнал запрошен... (скоро будет)")
+        _send_signal(chat_id)
     elif text == "/chats":
         with _lock:
             count = len(_known_chats)
@@ -159,7 +181,7 @@ def _handle_command(chat_id, text, msg):
         _send_message(chat_id,
             "*ForexAI Telegram Bot*\n\n"
             "`/start` — активация\n"
-            "`/status` — баланс и позиция\n"
+            "`/status` — текущий статус системы\n"
             "`/signal` — текущий прогноз\n"
             "`/chats` — сколько чатов подключено\n"
             "`/help` — эта справка",
@@ -167,8 +189,82 @@ def _handle_command(chat_id, text, msg):
         )
 
 
+def _send_status(chat_id):
+    try:
+        # Import here to avoid circular dependency at module load
+        from broker import get_broker
+        broker = get_broker()
+        info = broker.account_info()
+        bal = info.balance if info else 0
+        eq = info.equity if info else 0
+        text = (
+            f"📊 *ForexAI Статус*\n\n"
+            f"`Баланс   : ${bal:,.2f}`\n"
+            f"`Эквити   : ${eq:,.2f}`\n"
+            f"`P&L      : ${eq - bal:+.2f}`\n\n"
+            f"⏱️ `{_utc_now()}`"
+        )
+    except Exception as e:
+        text = f"📊 *ForexAI Статус*\n\nБрокер недоступен.\n`{e}`"
+    _send_message(chat_id, text)
+
+
+def _send_signal(chat_id):
+    sig = None
+    if _cached_signal_ref:
+        try:
+            sig = _cached_signal_ref()
+            if not sig or not isinstance(sig, dict):
+                sig = None
+        except Exception:
+            sig = None
+    if not sig:
+        text = "📡 *ForexAI Сигнал*\n\nСигнал ещё не рассчитан. Попробуй через минуту."
+        _send_message(chat_id, text)
+        return
+
+    signal = sig.get("signal", "HOLD")
+    prob = sig.get("prob_up", 0.5)
+    adx = sig.get("adx", 0)
+    vol_high = bool(sig.get("vol_high", False))
+    atr = sig.get("atr_pips", 0)
+    sl = sig.get("sl_pips", 0)
+    tp = sig.get("tp_pips", 0)
+
+    if signal == "BUY":
+        emoji = "🟢"
+        sig_text = "*BUY*"
+    elif signal == "SELL":
+        emoji = "🔴"
+        sig_text = "*SELL*"
+    else:
+        emoji = "⚪"
+        sig_text = "*HOLD*"
+
+    text = (
+        f"📡 *ForexAI Сигнал*\n\n"
+        f"{emoji} {sig_text}\n"
+        f"`P(UP) = {prob:.4f}`\n"
+        f"`ADX   = {adx:.1f}`\n"
+        f"`Vol   = {'✅' if vol_high else '❌'}`\n"
+        f"`ATR   = {atr:.1f}p`\n"
+        f"`SL/TP = {sl:.1f}p / {tp:.1f}p`\n\n"
+        f"⏱️ `{sig.get('timestamp', '')}`"
+    )
+    _send_message(chat_id, text)
+
+
+def _utc_now():
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
 def _send_message(chat_id, text, parse_mode="Markdown"):
+    global _rate_limit_until
     if not _bot_token:
+        return False
+    if time.time() < _rate_limit_until:
+        log.warning(f"Rate limited, skipping message to {chat_id}")
         return False
     try:
         url = f"https://api.telegram.org/bot{_bot_token}/sendMessage"
@@ -179,8 +275,24 @@ def _send_message(chat_id, text, parse_mode="Markdown"):
             "disable_web_page_preview": True,
         }
         resp = requests.post(url, json=payload, timeout=10)
-        if not resp.json().get("ok"):
-            log.warning(f"Telegram send failed: {resp.text[:200]}")
+        result = resp.json()
+        if not result.get("ok"):
+            err_code = result.get("error_code", 0)
+            err_desc = result.get("description", "")
+            if err_code == 429:
+                retry_after = result.get("parameters", {}).get("retry_after", 30)
+                _rate_limit_until = time.time() + retry_after
+                log.warning(f"Telegram rate limit: retry after {retry_after}s")
+            else:
+                log.warning(f"Telegram send failed ({err_code}): {err_desc[:200]}")
+            # Fallback: try without parse_mode if markdown parsing failed
+            if "parse" in err_desc.lower() or "entities" in err_desc.lower():
+                try:
+                    payload.pop("parse_mode")
+                    resp2 = requests.post(url, json=payload, timeout=10)
+                    return resp2.json().get("ok", False)
+                except Exception:
+                    pass
             return False
         return True
     except Exception as e:
@@ -192,30 +304,30 @@ def _broadcast(text, parse_mode="Markdown"):
     with _lock:
         chats = list(_known_chats)
     if not chats:
-        chats = TELEGRAM_CONFIG.get("default_chat_ids", [])
-    if not chats:
         log.debug("No Telegram chats to broadcast to")
         return
+    # Run broadcast in background thread so caller is never blocked
+    threading.Thread(target=_do_broadcast, args=(chats, text, parse_mode), daemon=True).start()
+
+
+def _do_broadcast(chats, text, parse_mode):
     for chat_id in chats:
         try:
             _send_message(chat_id, text, parse_mode)
-            time.sleep(0.05)
         except Exception as e:
             log.error(f"Broadcast to {chat_id} failed: {e}")
+        time.sleep(0.1)  # gentle rate limiting between chats
 
 
 def _header():
     return (
         "```\n"
-        "╔══════════════════════════════════════════╗\n"
-        "║           🤖  F O R E X A I              ║\n"
-        "╚══════════════════════════════════════════╝\n"
+        "🤖  F O R E X A I  🤖\n"
         "```"
     )
 
 
 def _hash_sig(sig):
-    """Create deterministic hash of signal core values for dedup."""
     s = sig.get("signal", "HOLD")
     p = f"{sig.get('prob_up', 0):.4f}"
     a = f"{sig.get('adx', 0):.1f}"
