@@ -2,7 +2,11 @@ import threading
 import time
 import datetime
 import logging
+import json
+import re
 import numpy as np
+
+import requests
 
 from config import CTRADER_CONFIG
 
@@ -91,6 +95,70 @@ class CTraderClient:
         self._events.pop("ProtoOAErrorRes", None)
         return self._responses.get(response_name)
 
+    def _refresh_access_token(self) -> bool:
+        try:
+            cfg = CTRADER_CONFIG
+            refresh_token = cfg.get("refresh_token", "")
+            if not refresh_token:
+                log.error("No refresh_token in config — cannot refresh")
+                return False
+
+            token_url = "https://demo.ctraderapi.com/token" if "demo" in self.host else "https://live.ctraderapi.com/token"
+            data = {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+            }
+            log.info("Refreshing access token...")
+            resp = requests.post(token_url, data=data, timeout=15)
+            if resp.status_code != 200:
+                log.error(f"Token refresh failed: HTTP {resp.status_code} {resp.text[:200]}")
+                return False
+
+            token_data = resp.json()
+            new_access = token_data.get("access_token")
+            new_refresh = token_data.get("refresh_token", refresh_token)
+            if not new_access:
+                log.error(f"Token refresh response missing access_token: {token_data}")
+                return False
+
+            self.access_token = new_access
+            CTRADER_CONFIG["access_token"] = new_access
+            if new_refresh:
+                CTRADER_CONFIG["refresh_token"] = new_refresh
+
+            self._update_config_file(new_access, new_refresh)
+            log.info("Access token refreshed successfully")
+            return True
+        except Exception as e:
+            log.error(f"Token refresh exception: {e}")
+            return False
+
+    def _update_config_file(self, access_token, refresh_token):
+        try:
+            import os
+            config_path = os.path.join(os.path.dirname(__file__), "config.py")
+            with open(config_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            content = re.sub(
+                r'("access_token":\s*")[^"]*("\s*,?)',
+                rf'\g<1>{access_token}\g<2>',
+                content,
+            )
+            if refresh_token:
+                content = re.sub(
+                    r'("refresh_token":\s*")[^"]*("\s*,?)',
+                    rf'\g<1>{refresh_token}\g<2>',
+                    content,
+                )
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            log.info("config.py tokens updated")
+        except Exception as e:
+            log.warning(f"Could not update config.py: {e}")
+
     def _connect(self) -> bool:
         host = self.host
         if host in ("demo.ctraderapi.com", ""):
@@ -138,7 +206,6 @@ class CTraderClient:
             return False
         log.info("App auth OK")
 
-        
         self.account_id = self._resolve_account_id()
 
         log.info(f"Account auth with ctidTraderAccountId={self.account_id}...")
@@ -148,10 +215,28 @@ class CTraderClient:
         acc_res = self._send_and_wait(acc_auth, "ProtoOAAccountAuthRes", timeout=15)
         if acc_res is None:
             err = self._responses.get("ProtoOAErrorRes")
+            err_code = getattr(err, 'errorCode', '') if err else ''
+            err_desc = getattr(err, 'description', '') if err else ''
             if err:
-                log.error(f"Account auth error: {getattr(err, 'errorCode', '?')} {getattr(err, 'description', '?')}")
+                log.error(f"Account auth error: {err_code} {err_desc}")
             else:
                 log.error("Account auth failed — no response. Check access_token and account_id.")
+
+            if 'UNAUTHORIZED' in str(err_code).upper() or 'NOT_AUTHORIZED' in str(err_desc).upper() or 'INVALID_REQUEST' in str(err_code).upper():
+                log.info("Token appears expired — attempting refresh...")
+                if self._refresh_access_token():
+                    log.info("Retrying account auth with new token...")
+                    acc_auth.accessToken = self.access_token
+                    acc_res2 = self._send_and_wait(acc_auth, "ProtoOAAccountAuthRes", timeout=15)
+                    if acc_res2 is not None:
+                        log.info("Account auth OK after refresh")
+                        self._authed = True
+                        self._load_symbols()
+                        self._load_account_info()
+                        self._subscribe_main_symbols()
+                        log.info(f"cTrader ready: account={self.account_id}, symbols={len(self._symbols)}")
+                        return True
+                log.error("Token refresh did not resolve auth failure")
             return False
         log.info("Account auth OK")
         self._authed = True

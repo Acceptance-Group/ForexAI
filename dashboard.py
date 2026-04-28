@@ -1233,13 +1233,13 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
             try:
                 now = _utcnow()
                 today = now.strftime("%Y-%m-%d")
+                bot_status["last_check"] = now.isoformat()
 
                 if now.hour == 0 and now.minute < 10 and today != last_trade_date:
                     print(f"\n--- D1 bar close {now.strftime('%Y-%m-%d %H:%M')} UTC ---")
                     try:
                         sig = compute_signal()
                         signal = sig.get("signal", "HOLD")
-                        bot_status["last_check"] = now.isoformat()
                         bot_status["last_signal_time"] = sig.get("timestamp", "")
                         bot_status["errors"] = bot_status.get("errors", [])[-5:]
 
@@ -1282,6 +1282,7 @@ def run_bot_with_dashboard(host="0.0.0.0", port=5000):
                         last_trade_date = today
                     except Exception as e:
                         bot_status["errors"] = bot_status.get("errors", []) + [str(e)]
+                        bot_status["last_signal_time"] = ""
                         print(f"  Bot trade error: {e}")
 
                 retrain_hour = RETRAIN_CONFIG.get("retrain_hour_utc", 23)

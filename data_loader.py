@@ -453,6 +453,14 @@ def _build_dataset_inner(force_download: bool = False) -> pd.DataFrame:
 
     d1 = fetch_d1_data()
     if d1 is None or len(d1) < 500:
+        if os.path.exists(parquet_path):
+            try:
+                feats = pd.read_parquet(parquet_path)
+                if set(FEATURE_COLUMNS).issubset(set(feats.columns)):
+                    print(f"Broker fetch failed — using cached features ({len(feats)} rows)")
+                    return feats[FEATURE_COLUMNS]
+            except Exception:
+                pass
         raise RuntimeError("Cannot get D1 data. Check broker connection and try again.")
 
     cross_data = fetch_cross_symbols()
@@ -520,16 +528,28 @@ def load_raw_prices() -> pd.DataFrame:
         if _raw_prices_cache is not None and (now - _raw_prices_cache_ts) < _RAW_PRICES_CACHE_TTL:
             return _raw_prices_cache
 
-        if not os.path.exists(raw_path):
-            build_dataset(force_download=True)
+        def _read_raw():
+            return pd.read_parquet(raw_path)
 
-        try:
-            df = pd.read_parquet(raw_path)
-        except Exception as e:
-            print(f"Corrupted raw parquet, rebuilding: {e}")
-            os.remove(raw_path)
-            build_dataset(force_download=True)
-            df = pd.read_parquet(raw_path)
+        def _try_rebuild():
+            try:
+                build_dataset(force_download=True)
+                return _read_raw()
+            except Exception as e:
+                print(f"Rebuild failed, keeping existing data: {e}")
+                if os.path.exists(raw_path):
+                    return _read_raw()
+                raise
+
+        if not os.path.exists(raw_path):
+            df = _try_rebuild()
+        else:
+            try:
+                df = _read_raw()
+            except Exception as e:
+                print(f"Corrupted raw parquet, rebuilding: {e}")
+                os.remove(raw_path)
+                df = _try_rebuild()
 
         if not df.empty:
             last_bar = df.index[-1]
@@ -540,12 +560,11 @@ def load_raw_prices() -> pd.DataFrame:
             stale_threshold = 26 if DATA_CONFIG.get("timeframe") == "1d" else 6
             if hours_old > stale_threshold:
                 print(f"Raw prices stale ({hours_old:.1f}h old), refetching from broker...")
-                build_dataset(force_download=True)
                 try:
-                    df = pd.read_parquet(raw_path)
-                except Exception:
                     build_dataset(force_download=True)
-                    df = pd.read_parquet(raw_path)
+                    df = _read_raw()
+                except Exception as e:
+                    print(f"Stale refetch failed, using existing data: {e}")
 
         _raw_prices_cache = df
         _raw_prices_cache_ts = time.time()
